@@ -45,6 +45,7 @@ import {
   embedHashInName,
   extractBaseNameFromName,
   validateAllChannelsSync,
+  validateChannelSync,
   type ChannelSyncResult
 } from "@/lib/speaker-sync-hash";
 
@@ -294,23 +295,7 @@ export function SpeakerControlBar({ scope, channelCount = 4 }: SpeakerControlBar
           .replace("{channels}", formatChannelList(item.channels))
       });
 
-      const outcome = await applyToDevice({
-        mac: scope,
-        wayMappings: item.wayMappings,
-        speakerName: item.model
-      });
-
-      if (!outcome.ok) {
-        failedCount += 1;
-        firstError ??=
-          outcome.results.find((result) => !result.sent)?.error ?? outcome.error ?? "Unknown apply failure";
-        continue;
-      }
-
-      appliedCount += 1;
-
-      // Embed sync hash into output channel names after successful apply.
-      // Wait for the poller to deliver fresh params (stale data would produce wrong hash).
+      // Channels touched by this single preset, and their way-label base names.
       const appliedChannels0Based = Array.from(new Set(item.wayMappings.flatMap((m) => m.channels))).sort(
         (a, b) => a - b
       );
@@ -318,21 +303,82 @@ export function SpeakerControlBar({ scope, channelCount = 4 }: SpeakerControlBar
       const wayLabelByChannel = new Map<number, string>(
         item.wayMappings.flatMap((m) => m.channels.map((ch) => [ch, m.wayLabel ?? ""]))
       );
-      try {
-        const freshParams = await waitForFreshChannelData(scope);
-        if (freshParams?.channels) {
-          for (const ch0 of appliedChannels0Based) {
-            const chData = freshParams.channels[ch0];
-            if (!chData) continue;
-            const hash = computeSyncHashFromParsed(chData);
-            const baseName = wayLabelByChannel.get(ch0) || extractBaseNameFromName(chData.outputName);
-            const newName = embedHashInName(baseName, hash);
-            await renameOutput(scope, ch0 as 0 | 1 | 2 | 3, newName);
-          }
+
+      // Self-healing per SINGLE speaker preset: apply → embed sync hash → verify the
+      // checksum actually landed ("synced") by reading channel data back. If any applied
+      // channel is still not synced ("No Checksum"/drifted), re-apply and re-embed. Keep
+      // trying until every applied channel reports "synced" or the retry budget is spent.
+      const MAX_APPLY_ROUNDS = 4;
+      let itemSynced = false;
+      let lastApplyError: string | null = null;
+
+      for (let round = 0; round < MAX_APPLY_ROUNDS && !itemSynced; round += 1) {
+        if (round > 0) {
+          toast.loading(t.applyAllLoadingTitle, {
+            id: toastId,
+            description:
+              t.applyAllProgress
+                .replace("{index}", String(index + 1))
+                .replace("{total}", String(readyQueuedApplyItems.length))
+                .replace("{model}", item.model)
+                .replace("{channels}", formatChannelList(item.channels)) +
+              ` · Prüfe (${round + 1}/${MAX_APPLY_ROUNDS})`
+          });
         }
-      } catch {
-        // Hash embedding is best-effort — don't fail the entire apply
+
+        const outcome = await applyToDevice({
+          mac: scope,
+          wayMappings: item.wayMappings,
+          speakerName: item.model
+        });
+
+        if (!outcome.ok) {
+          lastApplyError =
+            outcome.results.find((result) => !result.sent)?.error ?? outcome.error ?? "Unknown apply failure";
+          // Send itself failed — try the whole apply again.
+          continue;
+        }
+
+        // Embed sync hash into output channel names after successful apply.
+        // Wait for the poller to deliver fresh params (stale data would produce wrong hash).
+        try {
+          const freshParams = await waitForFreshChannelData(scope);
+          if (freshParams?.channels) {
+            for (const ch0 of appliedChannels0Based) {
+              const chData = freshParams.channels[ch0];
+              if (!chData) continue;
+              const hash = computeSyncHashFromParsed(chData);
+              const baseName = wayLabelByChannel.get(ch0) || extractBaseNameFromName(chData.outputName);
+              const newName = embedHashInName(baseName, hash);
+              await renameOutput(scope, ch0 as 0 | 1 | 2 | 3, newName);
+            }
+          }
+        } catch {
+          // Hash embedding is best-effort — the verify step below decides success.
+        }
+
+        // Verify: read fresh data back and confirm every applied channel is "synced".
+        // Poll a couple of times so the rename has a chance to settle before we give up
+        // on this round and re-apply.
+        for (let verifyPoll = 0; verifyPoll < 3 && !itemSynced; verifyPoll += 1) {
+          const verifyParams = await waitForFreshChannelData(scope);
+          const channels = verifyParams?.channels;
+          if (!channels) continue;
+          itemSynced = appliedChannels0Based.every((ch0) => {
+            const chData = channels[ch0];
+            return chData ? validateChannelSync(chData).status === "synced" : false;
+          });
+        }
       }
+
+      if (!itemSynced) {
+        failedCount += 1;
+        firstError ??= lastApplyError ?? "Checksum konnte nicht bestätigt werden (No Checksum)";
+        // Skip post-apply actions for a preset we could not confirm.
+        continue;
+      }
+
+      appliedCount += 1;
 
       // Run post-apply actions for this item
       const allAppliedChannels0Based = Array.from(new Set(item.wayMappings.flatMap((m) => m.channels))).sort(
