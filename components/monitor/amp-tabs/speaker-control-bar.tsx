@@ -350,7 +350,9 @@ export function SpeakerControlBar({ scope, channelCount = 4 }: SpeakerControlBar
               const hash = computeSyncHashFromParsed(chData);
               const baseName = wayLabelByChannel.get(ch0) || extractBaseNameFromName(chData.outputName);
               const newName = embedHashInName(baseName, hash);
-              await renameOutput(scope, ch0 as 0 | 1 | 2 | 3, newName);
+              // Server verifies the rename landed; suppress its per-attempt toast —
+              // this loop's own verify + retry decides overall success.
+              await renameOutput(scope, ch0 as 0 | 1 | 2 | 3, newName, { suppressToast: true });
             }
           }
         } catch {

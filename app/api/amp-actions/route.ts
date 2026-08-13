@@ -796,10 +796,19 @@ export async function POST(request: Request): Promise<Response> {
       // -----------------------------------------------------------------------
       case "renameOutput": {
         const payload = Buffer.alloc(16, 0);
-        const nameBytes = Buffer.from(value, "ascii").subarray(0, CHANNEL_NAME_MAX_LENGTH);
+        const nameBytes = Buffer.from(String(value), "ascii").subarray(0, CHANNEL_NAME_MAX_LENGTH);
         nameBytes.copy(payload, 0);
-        await device.sendControl(FuncCode.SPEAKER_NAME, channel, payload, 1 /* Output */);
-        break;
+        // The device parses the name as null-terminated ASCII, so the read-back
+        // equals the bytes we wrote (truncated to CHANNEL_NAME_MAX_LENGTH).
+        const expectedName = nameBytes.toString("ascii");
+        // Verify the rename actually landed. The sync-hash embedded in output
+        // names (Speaker Config "Apply all") depends on this taking effect, and
+        // the fire-and-forget path silently dropped renames on 1.1.9 → "No Checksum".
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.SPEAKER_NAME, channel, payload, 1 /* Output */),
+          (c) => c.outputName === expectedName
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------

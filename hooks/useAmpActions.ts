@@ -100,7 +100,12 @@ interface AmpActionsHook {
   invertPolarityOut: (mac: string, channel: Channel, inverted: boolean) => Promise<void>;
   noiseGateOut: (mac: string, channel: Channel, enabled: boolean) => Promise<void>;
   renameInput: (mac: string, channel: Channel, name: string) => Promise<void>;
-  renameOutput: (mac: string, channel: Channel, name: string) => Promise<void>;
+  renameOutput: (
+    mac: string,
+    channel: Channel,
+    name: string,
+    opts?: { suppressToast?: boolean; throwOnError?: boolean }
+  ) => Promise<void>;
   rmsLimiterOut: (mac: string, channel: Channel, enabled: boolean, params?: RmsLimiterParams) => Promise<void>;
   setRmsLimiterAttack: (
     mac: string,
@@ -736,10 +741,15 @@ function createAmpActions(): AmpActionsHook {
     await sendSingle("useAmpActions.renameInput", mac, "renameInput", channel, trimmed);
   };
 
-  const renameOutput = async (mac: string, channel: Channel, name: string) => {
+  const renameOutput = async (
+    mac: string,
+    channel: Channel,
+    name: string,
+    opts?: { suppressToast?: boolean; throwOnError?: boolean }
+  ) => {
     const trimmed = name.trim().slice(0, CHANNEL_NAME_MAX_LENGTH);
     if (!trimmed) return;
-    await sendSingle("useAmpActions.renameOutput", mac, "renameOutput", channel, trimmed);
+    await sendSingle("useAmpActions.renameOutput", mac, "renameOutput", channel, trimmed, undefined, opts);
   };
 
   return {
