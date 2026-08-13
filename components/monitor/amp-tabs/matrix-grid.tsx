@@ -3,9 +3,6 @@
 import { useEffect, useState } from "react";
 import type { ChannelParams } from "@/stores/AmpStore";
 import { useAmpActions } from "@/hooks/useAmpActions";
-import { Input } from "@/components/ui/input";
-import { Button } from "@/components/ui/button";
-import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { MATRIX_GAIN_MAX_DB, MATRIX_GAIN_MIN_DB } from "@/lib/constants";
 
 function MatrixCell({
@@ -21,92 +18,84 @@ function MatrixCell({
   onToggleActive: () => void;
   onGainChange: (db: number) => void;
 }) {
-  const [open, setOpen] = useState(false);
   const [draft, setDraft] = useState(String(gain));
 
   useEffect(() => {
     setDraft(String(gain));
   }, [gain]);
 
-  const label = active ? (gain === 0 ? "0 dB" : `${gain > 0 ? "+" : ""}${gain} dB`) : "Mute";
-
   const clampGain = (value: number) => Math.max(MATRIX_GAIN_MIN_DB, Math.min(MATRIX_GAIN_MAX_DB, value));
 
-  const handleCommit = (close = false) => {
-    if (disabled) {
-      if (close) setOpen(false);
-      return;
-    }
+  const commitGain = () => {
     const parsed = Number.parseFloat(draft);
     if (!Number.isNaN(parsed)) {
       const clamped = clampGain(parsed);
       setDraft(String(clamped));
-      onGainChange(clamped);
+      if (clamped !== gain) onGainChange(clamped);
     } else {
       setDraft(String(gain));
     }
-    if (close) setOpen(false);
   };
 
+  if (disabled) {
+    return (
+      <div className="flex w-24 h-14 select-none flex-col items-center justify-center gap-0.5 rounded-md border border-border bg-muted/30 text-xs text-muted-foreground/60">
+        <span>N/A</span>
+        <span className="text-[9px]">Disabled</span>
+      </div>
+    );
+  }
+
+  // Single click anywhere on the cell toggles the crosspoint on/off. The gain
+  // field stops click propagation so editing gain doesn't also toggle.
   return (
-    <Popover open={open} onOpenChange={(nextOpen) => setOpen(disabled ? false : nextOpen)}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          disabled={disabled}
-          className={`
-            flex flex-col items-center justify-center rounded-md w-24 h-14
-            text-xs font-medium border gap-0.5 select-none transition-colors
-            ${
-              disabled
-                ? "bg-muted/30 border-border text-muted-foreground/60"
-                : active
-                  ? "bg-card border-primary text-foreground hover:shadow-md"
-                  : "bg-card border-border text-muted-foreground hover:bg-muted/30 hover:border-primary/40"
-            }
-          `}
-        >
-          <span>{disabled ? "N/A" : label}</span>
-          <span className={`text-[9px] ${active && !disabled ? "text-primary" : "text-muted-foreground"}`}>
-            {disabled ? "Disabled" : active ? "Active" : "Bypassed"}
-          </span>
-        </button>
-      </PopoverTrigger>
-      <PopoverContent className="w-52 p-3 space-y-2" sideOffset={8}>
-        <div className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">Matrix Gain</div>
-        <Input
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onToggleActive}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onToggleActive();
+        }
+      }}
+      title="Klick: an/aus"
+      className={`flex w-24 h-14 cursor-pointer select-none flex-col items-center justify-center gap-1 rounded-md border transition-colors ${
+        active
+          ? "border-primary bg-card text-foreground hover:shadow-md"
+          : "border-border bg-card text-muted-foreground hover:bg-muted/30 hover:border-primary/40"
+      }`}
+    >
+      <span className={`text-[9px] font-semibold uppercase tracking-wider ${active ? "text-primary" : "text-muted-foreground"}`}>
+        {active ? "An" : "Aus"}
+      </span>
+      <div className="flex items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
+        <input
           type="number"
-          step="0.5"
-          min={String(MATRIX_GAIN_MIN_DB)}
-          max={String(MATRIX_GAIN_MAX_DB)}
-          disabled={disabled || !active}
-          className="h-8 text-center text-xs tabular-nums"
+          step={0.5}
+          min={MATRIX_GAIN_MIN_DB}
+          max={MATRIX_GAIN_MAX_DB}
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
-          onBlur={() => handleCommit(false)}
+          onBlur={commitGain}
           onKeyDown={(e) => {
-            if (e.key === "Enter") handleCommit(true);
+            if (e.key === "Enter") {
+              commitGain();
+              (e.target as HTMLInputElement).blur();
+            }
             if (e.key === "Escape") {
               setDraft(String(gain));
-              setOpen(false);
+              (e.target as HTMLInputElement).blur();
             }
           }}
+          aria-label="Matrix Gain dB"
+          className={`h-6 w-12 rounded border border-border bg-background text-center text-[11px] tabular-nums focus:outline-none focus:ring-1 focus:ring-primary [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none ${
+            active ? "" : "opacity-70"
+          }`}
         />
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="w-full"
-          disabled={disabled}
-          onClick={onToggleActive}
-        >
-          {active ? "Bypass" : "Enable"}
-        </Button>
-        <div className="text-[10px] text-muted-foreground text-center">
-          Range: {MATRIX_GAIN_MIN_DB.toFixed(1)} to +{MATRIX_GAIN_MAX_DB.toFixed(1)} dB
-        </div>
-      </PopoverContent>
-    </Popover>
+        <span className="text-[9px] text-muted-foreground">dB</span>
+      </div>
+    </div>
   );
 }
 
