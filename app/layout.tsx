@@ -1,10 +1,15 @@
 import type { Metadata } from "next";
-import { Outfit } from "next/font/google";
+import localFont from "next/font/local";
 import "./globals.css";
 
-const fontSans = Outfit({
-  subsets: ["latin"],
-  variable: "--font-sans"
+// Outfit is bundled locally (app/fonts/Outfit.woff2, variable 100–900, latin)
+// instead of next/font/google so the production build does NOT need to reach
+// fonts.googleapis.com at build time — builds stay reliable on flaky/offline nets.
+const fontSans = localFont({
+  src: "./fonts/Outfit.woff2",
+  variable: "--font-sans",
+  weight: "100 900",
+  display: "swap"
 });
 
 export const metadata: Metadata = {

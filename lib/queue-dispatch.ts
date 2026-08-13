@@ -2,6 +2,7 @@ import { toast } from "sonner";
 import { useQueueStore, createStep, type QueuePacket, type QueuePriority, type QueueStep } from "@/stores/QueueStore";
 import { getLinkedChannels, type LinkScope } from "@/lib/amp-action-linking";
 import { getStoredAmpLinkConfig, useAmpActionLinkStore } from "@/stores/AmpActionLinkStore";
+import { useActionPending } from "@/stores/ActionPendingStore";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -65,36 +66,44 @@ export async function dispatch(opts: DispatchOptions): Promise<QueuePacket> {
     createStep(target.mac, endpoint, buildPayload(target), target.channel)
   );
 
-  const packetId = useQueueStore.getState().enqueue({
-    origin,
-    action,
-    priority,
-    steps
-  });
+  // Mark an action in flight so the UI shows a loading indicator from the moment
+  // the user clicks until the amp has confirmed it (the backend reads the value
+  // back before responding).
+  useActionPending.getState().begin();
+  try {
+    const packetId = useQueueStore.getState().enqueue({
+      origin,
+      action,
+      priority,
+      steps
+    });
 
-  // Wait for the packet to finish processing
-  const packet = await waitForPacket(packetId);
+    // Wait for the packet to finish processing
+    const packet = await waitForPacket(packetId);
 
-  if (packet.status === "failed" || packet.status === "partial") {
-    const failedSteps = packet.steps.filter((s) => s.status === "failed");
-    const firstError = failedSteps[0]?.error ?? "Unknown error";
+    if (packet.status === "failed" || packet.status === "partial") {
+      const failedSteps = packet.steps.filter((s) => s.status === "failed");
+      const firstError = failedSteps[0]?.error ?? "Unknown error";
 
-    if (!suppressToast) {
-      const totalSteps = packet.steps.length;
-      const failedCount = failedSteps.length;
-      if (totalSteps > 1) {
-        toast.error(`${action} partially failed (${totalSteps - failedCount}/${totalSteps}): ${firstError}`);
-      } else {
-        toast.error(`Command failed: ${firstError}`);
+      if (!suppressToast) {
+        const totalSteps = packet.steps.length;
+        const failedCount = failedSteps.length;
+        if (totalSteps > 1) {
+          toast.error(`${action} partially failed (${totalSteps - failedCount}/${totalSteps}): ${firstError}`);
+        } else {
+          toast.error(`Command failed: ${firstError}`);
+        }
+      }
+
+      if (throwOnError) {
+        throw new Error(failedSteps[0]?.error ?? `${action} failed`);
       }
     }
 
-    if (throwOnError) {
-      throw new Error(failedSteps[0]?.error ?? `${action} failed`);
-    }
+    return packet;
+  } finally {
+    useActionPending.getState().end();
   }
-
-  return packet;
 }
 
 // ---------------------------------------------------------------------------

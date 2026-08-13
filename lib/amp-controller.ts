@@ -34,7 +34,8 @@ import {
   buildStructHeader,
   buildNetworkDataHeader,
   calcCheckCode,
-  FRAGMENT_SIZE
+  FRAGMENT_SIZE,
+  NETWORK_HEADER_LEN
 } from "@/lib/network/protocol";
 
 // ---------------------------------------------------------------------------
@@ -739,7 +740,16 @@ class AmpController extends EventEmitter {
         // Some amps ACK every fragment with a generic 1/1/0 tuple.
         const genericMatch = nd.packetsStep === 1 && nd.packetsCount === 1 && nd.packetsLastlen === 0;
 
-        if (strictMatch || genericMatch) {
+        // A header-only packet (no struct/body) with data_state=1 is a pure ACK.
+        // Firmware versions fill packetsCount/packetsLastlen inconsistently — FW
+        // 1.1.8 sends 1/0, FW 1.1.9 sends 0/450 — so those fields cannot be used
+        // to correlate. Since fragments are sent strictly sequentially (only one
+        // in flight while a pendingAck exists), any header-only ACK from this IP
+        // acknowledges the current fragment. This unblocks FC=57 speaker-data
+        // apply on 1.1.9 (previously "ACK timed out" -> speaker preset apply failed).
+        const headerOnlyAck = raw.length === NETWORK_HEADER_LEN;
+
+        if (strictMatch || genericMatch || headerOnlyAck) {
           this.pendingSendAckByIp.delete(ip);
           clearTimeout(pendingAck.timeout);
           pendingAck.resolve();

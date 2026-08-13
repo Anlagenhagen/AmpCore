@@ -108,14 +108,24 @@ module.exports = {
       const fs = require("fs");
 
       const nextDir = path.join(__dirname, ".next");
-      if (fs.existsSync(nextDir)) {
-        fs.rmSync(nextDir, { recursive: true, force: true });
-        console.log("✓ Cleaned .next directory");
-      }
 
-      console.log("Building Next.js application...");
-      execSync("pnpm run build", { stdio: "inherit", cwd: __dirname });
-      console.log("✓ Next.js build complete");
+      // Allow reusing an already-built .next (e.g. built manually just before) to
+      // avoid a redundant rebuild — useful when network is flaky (next/font/google
+      // fetches at build time). Default behaviour (clean + build) is unchanged.
+      const reuseBuild =
+        process.env.SKIP_NEXT_BUILD === "1" && fs.existsSync(path.join(nextDir, "standalone"));
+
+      if (reuseBuild) {
+        console.log("↷ SKIP_NEXT_BUILD=1 — reusing existing .next build");
+      } else {
+        if (fs.existsSync(nextDir)) {
+          fs.rmSync(nextDir, { recursive: true, force: true });
+          console.log("✓ Cleaned .next directory");
+        }
+        console.log("Building Next.js application...");
+        execSync("pnpm run build", { stdio: "inherit", cwd: __dirname });
+        console.log("✓ Next.js build complete");
+      }
 
       // Copy public/ and .next/static/ into standalone dir for Next.js standalone mode.
       const standaloneDir = path.join(__dirname, ".next", "standalone");

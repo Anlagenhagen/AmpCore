@@ -46,5 +46,9 @@ next-env.d.ts
 storage
 original_app_analyses
 
+# firmware captures: binaries can be large; keep them local, logs stay in git
+captures/**/*.pcap
+captures/**/*.pcapng
+
 dist
 .github/copilot-instructions.md

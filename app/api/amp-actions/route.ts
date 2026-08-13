@@ -49,6 +49,7 @@ import { ampController } from "@/lib/amp-controller";
 import { CvrAmpDevice, FuncCode } from "@/lib/amp-device";
 import { applySimulatedAction, isSimulatedMac } from "@/lib/simulated-amps";
 import { ampActionRequestSchema, type AmpActionRequest } from "@/lib/validation/amp-actions";
+import { parseFC27Channels, type ChannelData } from "@/lib/parse-channel-data";
 import { AMP_NAME_MAX_LENGTH, CHANNEL_NAME_MAX_LENGTH } from "@/lib/constants";
 import { FIR_MAX_TAPS, FIR_NAME_MAX_BYTES } from "@/lib/fir";
 
@@ -123,6 +124,52 @@ export async function POST(request: Request): Promise<Response> {
 
   const device = new CvrAmpDevice(ip);
 
+  // Confirmed send: fire the (fire-and-forget) control, then read the channel back
+  // (FC=27) and re-send until the expected value is actually present. Returns true
+  // only when the amp confirmed the change. If it can NEVER be confirmed (value
+  // didn't land, or read-back keeps failing) it returns false — the caller then
+  // reports a real error, so an action that didn't actually push is never silently
+  // treated as "ok". Certainty over speed (per requirement).
+  const applyVerifiedControl = async (
+    send: () => Promise<void>,
+    check: (chan: ChannelData) => boolean,
+    rounds = 3
+  ): Promise<boolean> => {
+    await send();
+    for (let r = 0; r < rounds; r++) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      let confirmed = false;
+      try {
+        const hex = (await ampController.requestFC27(mac, 0)).toString("hex");
+        const chan = parseFC27Channels(hex)[channel];
+        confirmed = !!chan && check(chan);
+      } catch {
+        confirmed = false; // couldn't read back -> not confirmed, retry
+      }
+      if (confirmed) return true;
+      await send();
+    }
+    return false;
+  };
+
+  // Turn a verification result into a response. When the amp did NOT confirm the
+  // change, return a real HTTP error so the UI surfaces a failure instead of a
+  // silent "ok" — an action that didn't actually push must report an error.
+  const respondVerified = (verified: boolean): Response =>
+    verified
+      ? Response.json({ ok: true, mac, action, channel, value, verified: true })
+      : Response.json(
+          {
+            error: `"${action}" (Kanal ${channel}) konnte nicht bestätigt werden — der Amp hat die Änderung nicht übernommen. Bitte erneut versuchen.`,
+            mac,
+            action,
+            channel,
+            value,
+            verified: false
+          },
+          { status: 502 }
+        );
+
   try {
     switch (action) {
       // -----------------------------------------------------------------------
@@ -152,9 +199,16 @@ export async function POST(request: Request): Promise<Response> {
       // Wire body: 0x00=muted, 0x01=unmuted
       // -----------------------------------------------------------------------
       case "muteIn": {
+        // Safety-critical: a mute that silently drops (packet lost on WiFi) would
+        // leave the input live while the UI briefly shows muted, then "jump back"
+        // to unmuted on the next poll. Confirm the amp actually took it.
         const payload = Buffer.from([value ? 0x00 : 0x01]);
-        await device.sendControl(FuncCode.MUTE, channel, payload, 0 /* input */);
-        break;
+        const want = Boolean(value);
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.MUTE, channel, payload, 0 /* input */),
+          (c) => c.muteIn === want
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -167,8 +221,12 @@ export async function POST(request: Request): Promise<Response> {
       case "volumeIn": {
         const payload = Buffer.alloc(4);
         payload.writeFloatLE(value, 0);
-        await device.sendControl(FuncCode.VOL, channel, payload, 0 /* input */);
-        break;
+        const want = value;
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.VOL, channel, payload, 0 /* input */),
+          (c) => Math.abs(c.volumeOut - want) <= 0.15
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -177,9 +235,15 @@ export async function POST(request: Request): Promise<Response> {
       // Wire body: 0x00=muted, 0x01=unmuted
       // -----------------------------------------------------------------------
       case "muteOut": {
+        // Safety-critical (see muteIn): confirm the output mute actually landed
+        // instead of fire-and-forget, so it can't silently revert to unmuted.
         const payload = Buffer.from([value ? 0x00 : 0x01]);
-        await device.sendControl(FuncCode.MUTE, channel, payload, 1 /* Output */);
-        break;
+        const want = Boolean(value);
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.MUTE, channel, payload, 1 /* Output */),
+          (c) => c.muteOut === want
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -189,8 +253,12 @@ export async function POST(request: Request): Promise<Response> {
       // -----------------------------------------------------------------------
       case "invertPolarityOut": {
         const payload = Buffer.from([value ? 0x01 : 0x00]);
-        await device.sendControl(FuncCode.PHASE, channel, payload, 1 /* Output */);
-        break;
+        const want = Boolean(value);
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.PHASE, channel, payload, 1 /* Output */),
+          (c) => c.invertedOut === want
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -201,8 +269,12 @@ export async function POST(request: Request): Promise<Response> {
       // -----------------------------------------------------------------------
       case "noiseGateOut": {
         const payload = Buffer.from([value ? 0x00 : 0x01]);
-        await device.sendControl(FuncCode.NOISE_GATE, channel, payload, 1 /* Output */);
-        break;
+        const want = Boolean(value);
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.NOISE_GATE, channel, payload, 1 /* Output */),
+          (c) => c.noiseGateOut === want
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -222,7 +294,14 @@ export async function POST(request: Request): Promise<Response> {
           payload.writeFloatLE(body.thresholdVrms, 3);
           payload.writeUInt8(value ? 0x00 : 0x01, 7); // 0=enabled, 1=bypassed
 
-          await device.sendControl(FuncCode.RMS_LIMITER, channel, payload, 1 /* Output */);
+          const thr = body.thresholdVrms;
+          const verified = await applyVerifiedControl(
+            () => device.sendControl(FuncCode.RMS_LIMITER, channel, payload, 1 /* Output */),
+            (c) =>
+              typeof c.rmsLimiter?.thresholdVrms === "number" &&
+              Math.abs(c.rmsLimiter.thresholdVrms - thr) <= Math.max(0.05, Math.abs(thr) * 0.02)
+          );
+          return respondVerified(verified);
         } else {
           const payload = Buffer.from([value ? 0x00 : 0x01]);
           await device.sendControl(FuncCode.RMS_BYPASS, channel, payload, 1 /* Output */);
@@ -247,7 +326,14 @@ export async function POST(request: Request): Promise<Response> {
           payload.writeFloatLE(body.thresholdVp, 4);
           payload.writeUInt8(value ? 0x00 : 0x01, 8); // 0=enabled, 1=bypassed
 
-          await device.sendControl(FuncCode.PEAK_LIMITER, channel, payload, 1 /* Output */);
+          const thr = body.thresholdVp;
+          const verified = await applyVerifiedControl(
+            () => device.sendControl(FuncCode.PEAK_LIMITER, channel, payload, 1 /* Output */),
+            (c) =>
+              typeof c.peakLimiter?.thresholdVp === "number" &&
+              Math.abs(c.peakLimiter.thresholdVp - thr) <= Math.max(0.05, Math.abs(thr) * 0.02)
+          );
+          return respondVerified(verified);
         } else {
           const payload = Buffer.from([value ? 0x00 : 0x01]);
           await device.sendControl(FuncCode.PEAK_BYPASS, channel, payload, 1 /* Output */);
@@ -293,8 +379,12 @@ export async function POST(request: Request): Promise<Response> {
       // -----------------------------------------------------------------------
       case "sourceType": {
         const payload = Buffer.from([value]);
-        await device.sendControl(FuncCode.SOURCE_SELECT, channel, payload, 0 /* input */);
-        break;
+        const want = value;
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.SOURCE_SELECT, channel, payload, 0 /* input */),
+          (c) => c.sourceTypeCode === want
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -360,8 +450,12 @@ export async function POST(request: Request): Promise<Response> {
       case "delayIn": {
         const payload = Buffer.alloc(4);
         payload.writeFloatLE(value, 0);
-        await device.sendControl(FuncCode.DELAY, channel, payload, 0 /* input */);
-        break;
+        const want = value;
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.DELAY, channel, payload, 0 /* input */),
+          (c) => Math.abs(c.delayIn - want) <= 0.05
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -371,8 +465,12 @@ export async function POST(request: Request): Promise<Response> {
       case "delayOut": {
         const payload = Buffer.alloc(4);
         payload.writeFloatLE(value, 0);
-        await device.sendControl(FuncCode.DELAY, channel, payload, 1 /* Output */);
-        break;
+        const want = value;
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.DELAY, channel, payload, 1 /* Output */),
+          (c) => Math.abs(c.delayOut - want) <= 0.05
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -383,8 +481,12 @@ export async function POST(request: Request): Promise<Response> {
       case "outputTrim": {
         const payload = Buffer.alloc(4);
         payload.writeFloatLE(value, 0);
-        await device.sendControl(FuncCode.VOL, channel, payload, 1 /* Output */);
-        break;
+        const want = value;
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.VOL, channel, payload, 1 /* Output */),
+          (c) => Math.abs(c.trimOut - want) <= 0.15
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -398,8 +500,12 @@ export async function POST(request: Request): Promise<Response> {
       // -----------------------------------------------------------------------
       case "powerModeOut": {
         const payload = Buffer.from([value]);
-        await device.sendControl(POWER_MODE_FUNC_CODE, channel, payload, 1 /* Output */);
-        break;
+        const want = value;
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(POWER_MODE_FUNC_CODE, channel, payload, 1 /* Output */),
+          (c) => c.powerMode === want
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -421,16 +527,20 @@ export async function POST(request: Request): Promise<Response> {
       // -----------------------------------------------------------------------
       case "crossoverEnabled": {
         const payload = Buffer.from([getCrossoverTypeByte(body.kind, value, body.filterType)]);
-        await device.sendControl(
-          FuncCode.FILTER_TYPE,
-          channel,
-          payload,
-          getCrossoverInOutFlag(body.target),
-          getCrossoverLink(),
-          getCrossoverSegment(body.kind)
+        const inOut = getCrossoverInOutFlag(body.target);
+        const seg = getCrossoverSegment(body.kind); // 0 = HP band, 9 = LP band
+        const want = Boolean(value);
+        const verified = await applyVerifiedControl(
+          async () => {
+            await device.sendControl(FuncCode.FILTER_TYPE, channel, payload, inOut, getCrossoverLink(), seg);
+            await device.commitCrossover();
+          },
+          (c) => {
+            const b = (inOut === 0 ? c.eqIn : c.eqOut)?.[seg];
+            return !!b && b.bypass === !want; // enabled => not bypassed
+          }
         );
-        await device.commitCrossover();
-        break;
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -441,60 +551,123 @@ export async function POST(request: Request): Promise<Response> {
       case "crossoverFreq": {
         const payload = Buffer.alloc(4);
         payload.writeFloatLE(value, 0);
-        await device.sendControl(
-          FuncCode.FILTER_FREQ,
-          channel,
-          payload,
-          getCrossoverInOutFlag(body.target),
-          getCrossoverLink(),
-          getCrossoverSegment(body.kind)
+        const inOut = getCrossoverInOutFlag(body.target);
+        const seg = getCrossoverSegment(body.kind);
+        const want = value;
+        const verified = await applyVerifiedControl(
+          async () => {
+            await device.sendControl(FuncCode.FILTER_FREQ, channel, payload, inOut, getCrossoverLink(), seg);
+            await device.commitCrossover();
+          },
+          (c) => {
+            const b = (inOut === 0 ? c.eqIn : c.eqOut)?.[seg];
+            return !!b && Math.abs(b.freq - want) <= Math.max(1, want * 0.02);
+          }
         );
-        await device.commitCrossover();
-        break;
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
-      // Full 10-band EQ apply job — writes HP, EQ1-8, LP in sequence.
-      // This path intentionally applies the whole block to avoid partial-state
-      // drift across linked channels when users edit rapidly.
+      // Full 10-band EQ apply job — writes HP, EQ1-8, LP.
+      // The per-band writes are fire-and-forget (no ACK), so on WiFi/contention a
+      // burst of ~30 packets drops some silently → EQ only partially applied (the
+      // classic "copy-paste EQ takes 2-3 tries" symptom). This path now self-heals:
+      // after applying it reads the channel back (FC=27) and re-sends only the
+      // bands that did not land, up to a few rounds — the retries happen here
+      // automatically instead of the user re-pasting.
       // -----------------------------------------------------------------------
       case "eqBlock": {
         const inOutFlag = body.target === "input" ? 0 : 1;
+        const bands = body.bands;
 
-        for (let idx = 0; idx < body.bands.length; idx++) {
-          const band = body.bands[idx];
-
+        const sendBand = async (idx: number): Promise<void> => {
+          const band = bands[idx];
           if (idx === 0 || idx === 9) {
             const kind = idx === 0 ? "hp" : "lp";
-
             const typePayload = Buffer.from([getCrossoverTypeByte(kind, !band.bypass, band.type)]);
             await device.sendControl(FuncCode.FILTER_TYPE, channel, typePayload, inOutFlag, getCrossoverLink(), idx);
-
             const freqPayload = Buffer.alloc(4);
             freqPayload.writeFloatLE(band.freq, 0);
             await device.sendControl(FuncCode.FILTER_FREQ, channel, freqPayload, inOutFlag, getCrossoverLink(), idx);
-            continue;
+            return;
           }
-
           const typeByte = band.bypass ? 255 - band.type : band.type;
-          const typePayload = Buffer.from([typeByte]);
-          await device.sendControl(FuncCode.FILTER_TYPE, channel, typePayload, inOutFlag, 0, idx);
-
+          await device.sendControl(FuncCode.FILTER_TYPE, channel, Buffer.from([typeByte]), inOutFlag, 0, idx);
           const freqPayload = Buffer.alloc(4);
           freqPayload.writeFloatLE(band.freq, 0);
           await device.sendControl(FuncCode.FILTER_FREQ, channel, freqPayload, inOutFlag, 0, idx);
-
           const gainPayload = Buffer.alloc(4);
           gainPayload.writeFloatLE(band.gain, 0);
           await device.sendControl(FuncCode.FILTER_GAIN, channel, gainPayload, inOutFlag, 0, idx);
-
           const qPayload = Buffer.alloc(4);
           qPayload.writeFloatLE(band.q, 0);
           await device.sendControl(FuncCode.FILTER_Q, channel, qPayload, inOutFlag, 0, idx);
+        };
+
+        // Read the channel back and return the band indices that don't match yet.
+        // eqIn/eqOut live in the per-channel body, so they parse correctly even if
+        // the trailer-derived channel count would be off.
+        const findMismatchedBands = async (): Promise<number[]> => {
+          let hex: string;
+          try {
+            hex = (await ampController.requestFC27(mac, 0)).toString("hex");
+          } catch {
+            return []; // verification unavailable — don't spin
+          }
+          const chan = parseFC27Channels(hex)[channel];
+          const readback = inOutFlag === 0 ? chan?.eqIn : chan?.eqOut;
+          if (!chan || !Array.isArray(readback) || readback.length < bands.length) return [];
+          const mism: number[] = [];
+          for (let idx = 0; idx < bands.length; idx++) {
+            const want = bands[idx];
+            const got = readback[idx];
+            const isXover = idx === 0 || idx === 9;
+            let ok: boolean;
+            if (want.bypass) {
+              ok = got?.bypass === true;
+            } else {
+              ok =
+                !!got &&
+                got.bypass === false &&
+                got.type === want.type &&
+                Math.abs(got.freq - want.freq) <= Math.max(1, want.freq * 0.02) &&
+                (isXover || Math.abs(got.gain - want.gain) <= 0.25) &&
+                (isXover || Math.abs(got.q - want.q) <= 0.1);
+            }
+            if (!ok) mism.push(idx);
+          }
+          return mism;
+        };
+
+        // Round 1: apply everything.
+        for (let idx = 0; idx < bands.length; idx++) await sendBand(idx);
+        await device.commitCrossover();
+
+        // Self-healing rounds: re-send only what didn't land.
+        const maxRounds = 4;
+        let remaining: number[] = [];
+        for (let round = 0; round < maxRounds; round++) {
+          await new Promise((resolve) => setTimeout(resolve, 200)); // let writes settle before read
+          remaining = await findMismatchedBands();
+          if (remaining.length === 0) break;
+          for (const idx of remaining) await sendBand(idx);
+          await device.commitCrossover();
         }
 
-        await device.commitCrossover();
-        break;
+        if (remaining.length > 0) {
+          return Response.json(
+            {
+              error: `EQ nicht vollständig übernommen — ${remaining.length} Band/Bänder fehlen (Kanal ${channel}). Bitte erneut versuchen.`,
+              mac,
+              action,
+              channel,
+              verified: false,
+              remainingBands: remaining
+            },
+            { status: 502 }
+          );
+        }
+        return Response.json({ ok: true, mac, action, channel, verified: true });
       }
 
       // -----------------------------------------------------------------------
@@ -505,8 +678,18 @@ export async function POST(request: Request): Promise<Response> {
       case "eqBandType": {
         const typeByte = body.bypass ? 255 - body.value : body.value;
         const payload = Buffer.from([typeByte]);
-        await device.sendControl(FuncCode.FILTER_TYPE, channel, payload, body.target === "input" ? 0 : 1, 0, body.band);
-        break;
+        const wantType = body.value;
+        const wantBypass = Boolean(body.bypass);
+        const inOut = body.target === "input" ? 0 : 1;
+        const band = body.band;
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.FILTER_TYPE, channel, payload, inOut, 0, band),
+          (c) => {
+            const b = (inOut === 0 ? c.eqIn : c.eqOut)?.[band];
+            return !!b && (wantBypass ? b.bypass === true : b.bypass === false && b.type === wantType);
+          }
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -516,8 +699,17 @@ export async function POST(request: Request): Promise<Response> {
       case "eqBandFreq": {
         const payload = Buffer.alloc(4);
         payload.writeFloatLE(value, 0);
-        await device.sendControl(FuncCode.FILTER_FREQ, channel, payload, body.target === "input" ? 0 : 1, 0, body.band);
-        break;
+        const want = value;
+        const inOut = body.target === "input" ? 0 : 1;
+        const band = body.band;
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.FILTER_FREQ, channel, payload, inOut, 0, band),
+          (c) => {
+            const b = (inOut === 0 ? c.eqIn : c.eqOut)?.[band];
+            return !!b && Math.abs(b.freq - want) <= Math.max(1, want * 0.02);
+          }
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -529,8 +721,17 @@ export async function POST(request: Request): Promise<Response> {
       case "eqBandGain": {
         const payload = Buffer.alloc(4);
         payload.writeFloatLE(value, 0);
-        await device.sendControl(FuncCode.FILTER_GAIN, channel, payload, body.target === "input" ? 0 : 1, 0, body.band);
-        break;
+        const want = value;
+        const inOut = body.target === "input" ? 0 : 1;
+        const band = body.band;
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.FILTER_GAIN, channel, payload, inOut, 0, band),
+          (c) => {
+            const b = (inOut === 0 ? c.eqIn : c.eqOut)?.[band];
+            return !!b && Math.abs(b.gain - want) <= 0.25;
+          }
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -540,8 +741,17 @@ export async function POST(request: Request): Promise<Response> {
       case "eqBandQ": {
         const payload = Buffer.alloc(4);
         payload.writeFloatLE(value, 0);
-        await device.sendControl(FuncCode.FILTER_Q, channel, payload, body.target === "input" ? 0 : 1, 0, body.band);
-        break;
+        const want = value;
+        const inOut = body.target === "input" ? 0 : 1;
+        const band = body.band;
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.FILTER_Q, channel, payload, inOut, 0, band),
+          (c) => {
+            const b = (inOut === 0 ? c.eqIn : c.eqOut)?.[band];
+            return !!b && Math.abs(b.q - want) <= 0.1;
+          }
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------
@@ -605,9 +815,13 @@ export async function POST(request: Request): Promise<Response> {
       // C# reference: fir_bypass.fir_bypass, UDP.SendStruct(FIR_bypass, ch, Output)
       // -----------------------------------------------------------------------
       case "firBypass": {
-        const payload = Buffer.from([value ? 0x00 : 0x01]);
-        await device.sendControl(FuncCode.FIR_BYPASS, channel, payload, 1 /* Output */);
-        break;
+        const payload = Buffer.from([value ? 0x00 : 0x01]); // value=true => FIR enabled (wire 0x00)
+        const want = Boolean(value);
+        const verified = await applyVerifiedControl(
+          () => device.sendControl(FuncCode.FIR_BYPASS, channel, payload, 1 /* Output */),
+          (c) => c.firBypassed === !want // enabled => not bypassed
+        );
+        return respondVerified(verified);
       }
 
       // -----------------------------------------------------------------------

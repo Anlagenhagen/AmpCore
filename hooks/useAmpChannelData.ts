@@ -61,8 +61,14 @@ export function useAmpChannelData(): void {
               if (response.success && response.hex) {
                 const { syncChannelParams, updateAmpStatus } = useAmpStore.getState();
 
-                const channels = parseFC27Channels(response.hex, amp.sourceCapabilities);
-                const locked = parseFC27RotaryLock(response.hex);
+                // Authoritative channel count from FC=0 discovery (Output_chx).
+                // The FC=27 trailer size varies by firmware, so the parser must
+                // not derive the count from the payload length (see
+                // resolveFC27ChannelCount) — otherwise 1.1.9 mis-reads a phantom
+                // 5th channel and every trailer field (e.g. muteIn) shifts.
+                const authoritativeChannelCount = amp.output_chx ?? amp.constants?.channels?.length;
+                const channels = parseFC27Channels(response.hex, amp.sourceCapabilities, authoritativeChannelCount);
+                const locked = parseFC27RotaryLock(response.hex, authoritativeChannelCount);
 
                 syncChannelParams(amp.mac, channels);
                 if (locked !== undefined) {
