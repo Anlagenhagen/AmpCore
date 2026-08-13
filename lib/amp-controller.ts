@@ -396,6 +396,20 @@ class AmpController extends EventEmitter {
     return null;
   }
 
+  /** Authoritative output channel count (Output_chx from FC=0 discovery), or
+   *  undefined if the amp isn't discovered. Needed to parse FC=27 trailer fields
+   *  (e.g. muteIn) correctly — the trailer size varies by firmware, so the count
+   *  must not be derived from the payload length. */
+  getChannelCountForMac(mac: string): number | undefined {
+    for (const [m, entry] of this.knownMacs) {
+      if (m.toUpperCase() === mac.toUpperCase()) {
+        const n = entry.basicInfo?.Output_chx;
+        return typeof n === "number" && n > 0 ? n : undefined;
+      }
+    }
+    return undefined;
+  }
+
   /** Returns the MAC and name for a given IP, or null if not yet discovered. */
   getMacForIp(ip: string): { mac: string; name: string } | null {
     for (const [mac, entry] of this.knownMacs) {

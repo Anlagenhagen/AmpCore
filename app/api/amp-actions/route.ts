@@ -130,6 +130,12 @@ export async function POST(request: Request): Promise<Response> {
   // didn't land, or read-back keeps failing) it returns false — the caller then
   // reports a real error, so an action that didn't actually push is never silently
   // treated as "ok". Certainty over speed (per requirement).
+  // Authoritative output channel count (FC=0). Required so trailer-relative fields
+  // like muteIn parse correctly — otherwise on FW 1.1.9 (larger FC=27 trailer) the
+  // count is over-derived from length, muteIn reads out of bounds and unmute keeps
+  // "failing" verification even though it worked.
+  const channelCount = ampController.getChannelCountForMac(mac);
+
   const applyVerifiedControl = async (
     send: () => Promise<void>,
     check: (chan: ChannelData) => boolean,
@@ -141,7 +147,7 @@ export async function POST(request: Request): Promise<Response> {
       let confirmed = false;
       try {
         const hex = (await ampController.requestFC27(mac, 0)).toString("hex");
-        const chan = parseFC27Channels(hex)[channel];
+        const chan = parseFC27Channels(hex, undefined, channelCount)[channel];
         confirmed = !!chan && check(chan);
       } catch {
         confirmed = false; // couldn't read back -> not confirmed, retry
@@ -614,7 +620,7 @@ export async function POST(request: Request): Promise<Response> {
           } catch {
             return []; // verification unavailable — don't spin
           }
-          const chan = parseFC27Channels(hex)[channel];
+          const chan = parseFC27Channels(hex, undefined, channelCount)[channel];
           const readback = inOutFlag === 0 ? chan?.eqIn : chan?.eqOut;
           if (!chan || !Array.isArray(readback) || readback.length < bands.length) return [];
           const mism: number[] = [];
