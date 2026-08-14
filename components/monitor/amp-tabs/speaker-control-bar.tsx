@@ -326,16 +326,28 @@ export function SpeakerControlBar({ scope, channelCount = 4 }: SpeakerControlBar
           });
         }
 
+        // qos: true makes applyToDevice read each way's raw FC=57 blob back from the
+        // amp and byte-compare it against what we intended to send — real content
+        // verification, not just "the write left the Mac". This is what actually
+        // proves the preset was applied correctly; the sync-hash step below only
+        // detects drift *after* this has succeeded.
         const outcome = await applyToDevice({
           mac: scope,
           wayMappings: item.wayMappings,
-          speakerName: item.model
+          speakerName: item.model,
+          qos: true
         });
 
         if (!outcome.ok) {
+          const failedResult = outcome.results.find((result) => !result.sent || result.verified === false);
           lastApplyError =
-            outcome.results.find((result) => !result.sent)?.error ?? outcome.error ?? "Unknown apply failure";
-          // Send itself failed — try the whole apply again.
+            failedResult?.error ??
+            (failedResult?.verified === false
+              ? "Preset-Daten stimmten nach Rücklesen nicht mit dem Amp überein"
+              : undefined) ??
+            outcome.error ??
+            "Unknown apply failure";
+          // Send/verify failed — try the whole apply again.
           continue;
         }
 

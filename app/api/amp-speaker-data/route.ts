@@ -182,17 +182,20 @@ export async function POST(request: Request): Promise<Response> {
       try {
         const channelMask = 1 << ch;
 
+        const doSend = () =>
+          ampController.sendFC(
+            mac,
+            FuncCode.SPEAKER_DATA,
+            0, // chx=0 — channel encoded in link bitmask
+            body,
+            1, // inOutFlag = Output
+            channelMask, // link = channel bitmask
+            0, // statusCode = 0 (Response/inject)
+            10 // retained for API compatibility; send pacing is ACK-driven
+          );
+
         // Send via persistent socket with original ACK-paced fragmentation.
-        const sendMeta = await ampController.sendFC(
-          mac,
-          FuncCode.SPEAKER_DATA,
-          0, // chx=0 — channel encoded in link bitmask
-          body,
-          1, // inOutFlag = Output
-          channelMask, // link = channel bitmask
-          0, // statusCode = 0 (Response/inject)
-          10 // retained for API compatibility; send pacing is ACK-driven
-        );
+        let sendMeta = await doSend();
 
         // Give the amp ~500ms to process (original takes ~420ms based on Wireshark)
         await new Promise<void>((resolve) => setTimeout(resolve, 500));
@@ -200,12 +203,32 @@ export async function POST(request: Request): Promise<Response> {
         let verified: boolean | null = null; // null = not checked (QoS disabled)
 
         if (enableQos) {
-          try {
-            const readBack = await ampController.requestFC(mac, FuncCode.SPEAKER_DATA, ch, Buffer.alloc(0), 1, 3000);
-            verified = readBack.length === body.length;
-          } catch {
-            // QoS verification is best-effort and should not fail the write.
-            verified = false;
+          // Byte-for-byte read-back against the exact blob we intended to write —
+          // a length-only check would pass even if the amp stored the wrong preset
+          // content. If it doesn't match yet, resend and re-check a few times
+          // before giving up (the amp occasionally drops the ephemeral-style write).
+          const maxRounds = 3;
+          verified = false;
+          for (let round = 0; round < maxRounds && !verified; round++) {
+            if (round > 0) {
+              sendMeta = await doSend();
+              await new Promise<void>((resolve) => setTimeout(resolve, 500));
+            }
+            try {
+              const readBack = await ampController.requestFC(
+                mac,
+                FuncCode.SPEAKER_DATA,
+                ch,
+                Buffer.alloc(0),
+                1,
+                3000
+              );
+              verified = readBack.equals(body);
+            } catch {
+              // QoS verification is best-effort — treat a failed read-back as
+              // "not yet confirmed" and let the retry loop try again.
+              verified = false;
+            }
           }
         }
 
