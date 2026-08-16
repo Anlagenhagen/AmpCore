@@ -37,6 +37,23 @@ import { parseSpeakerData, detectSpeakerVariant, writeSpeakerNameIntoBlob } from
 
 export const dynamic = "force-dynamic";
 
+/**
+ * Every FC=57 variant (YCST/115/116/Phonic/117/Tecnare) starts with a 32-byte
+ * `deviceName` field. The amp stamps this with ITS OWN identity string on store —
+ * confirmed by reading back a preset captured on one amp model and applied to a
+ * different one: only these 32 bytes differed, the entire rest of the block
+ * (the actual EQ/crossover/limiter/delay preset content) matched exactly. Comparing
+ * this field would falsely flag a correctly-applied preset as failed whenever it's
+ * pasted onto a different physical amp than the one it was captured on.
+ */
+const DEVICE_NAME_FIELD_LEN = 32;
+
+function speakerDataContentEquals(readBack: Buffer, sent: Buffer): boolean {
+  if (readBack.length !== sent.length) return false;
+  const skip = Math.min(DEVICE_NAME_FIELD_LEN, sent.length);
+  return readBack.subarray(skip).equals(sent.subarray(skip));
+}
+
 export async function GET(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const mac = url.searchParams.get("mac");
@@ -223,7 +240,7 @@ export async function POST(request: Request): Promise<Response> {
                 1,
                 3000
               );
-              verified = readBack.equals(body);
+              verified = speakerDataContentEquals(readBack, body);
             } catch {
               // QoS verification is best-effort — treat a failed read-back as
               // "not yet confirmed" and let the retry loop try again.
