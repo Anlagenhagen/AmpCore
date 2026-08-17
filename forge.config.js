@@ -1,7 +1,19 @@
 const path = require("path");
+const os = require("os");
 require("dotenv").config();
 const { FusesPlugin } = require("@electron-forge/plugin-fuses");
 const { FuseV1Options, FuseVersion } = require("@electron/fuses");
+
+// Packaging writes/moves hundreds of MB. When the checkout lives inside a synced
+// folder (iCloud Drive's Desktop & Documents, Dropbox, …), the sync daemon
+// intercepts those file operations and packaging can block indefinitely at
+// "Finalizing package" — observed hanging 20+ min at 0% CPU, and leaving behind
+// empty conflict duplicates ("out/make 3", ".next/dev 2").
+//
+// Writing the output outside any synced folder avoids that. Override with
+// ELECTRON_FORGE_OUT_DIR if you want the artifacts somewhere specific.
+const outDir =
+  process.env.ELECTRON_FORGE_OUT_DIR || path.join(os.homedir(), "Library", "Caches", "AmpCore-build", "out");
 
 const packagerConfig = {
   name: "AmpCore",
@@ -54,6 +66,8 @@ const packagerConfig = {
 };
 
 module.exports = {
+  outDir,
+
   packagerConfig,
 
   rebuildConfig: {},
