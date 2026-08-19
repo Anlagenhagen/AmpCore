@@ -6,7 +6,14 @@ import { toast } from "sonner";
 // ---------------------------------------------------------------------------
 
 export type QueueStepStatus = "pending" | "inflight" | "done" | "failed";
-export type QueuePacketStatus = "queued" | "processing" | "completed" | "partial" | "failed";
+export type QueuePacketStatus =
+  | "queued"
+  | "processing"
+  | "completed"
+  | "partial"
+  | "failed"
+  /** Dropped before reaching the wire because a newer packet fully replaces it. */
+  | "superseded";
 export type QueuePriority = "realtime" | "reliable";
 
 export interface QueueStep {
@@ -62,6 +69,34 @@ function generateId(prefix: string): string {
 
 function coalesceKey(step: { mac: string; channel?: number; endpoint: string }, action: string): string {
   return `${step.mac}|${action}|${step.channel ?? "*"}|${step.endpoint}`;
+}
+
+// ---------------------------------------------------------------------------
+// Supersession for the reliable lane
+// ---------------------------------------------------------------------------
+
+/**
+ * Actions that write a COMPLETE state block, so a newer packet for the same
+ * scope makes an older still-queued one redundant. Dropping the stale one keeps
+ * rapid clicking responsive instead of building a backlog where every click
+ * costs a full apply+verify round-trip.
+ *
+ * Only add actions here whose payload is the entire state for that scope —
+ * incremental/relative actions must never be superseded.
+ */
+const SUPERSEDABLE_ACTIONS = new Set(["eqBlock"]);
+
+/** Scope identity of a supersedable packet: same scope ⇒ newer replaces older. */
+function supersedeKey(packet: QueuePacket): string | null {
+  if (!SUPERSEDABLE_ACTIONS.has(packet.action)) return null;
+  const scope = packet.steps
+    .map((s) => `${s.mac}#${s.channel ?? "*"}`)
+    .sort()
+    .join(",");
+  // eqBlock addresses input and output EQ separately — they must not supersede
+  // each other, so the target is part of the identity.
+  const target = typeof packet.steps[0]?.payload?.target === "string" ? packet.steps[0].payload.target : "";
+  return `${packet.action}|${scope}|${target}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +193,18 @@ async function executeStepWithRetry(step: QueueStep, retries: number): Promise<Q
 // ---------------------------------------------------------------------------
 
 const realtimePending = new Map<string, { packet: QueuePacket; timeout: ReturnType<typeof setTimeout> }>();
+
+// Reliable lane: one FIFO chain per amp. Writes to the same amp must not overlap —
+// the API verifies each write by reading channel data back, so two concurrent
+// multi-command operations (e.g. two EQ blocks from fast clicking) would each read
+// the other's values, treat them as a mismatch, re-send, and fight until one gives
+// up with "[Queue] eqBlock failed". Serializing per amp makes each verification see
+// only its own write. Different amps still run in parallel.
+const reliableChains = new Map<string, Promise<void>>();
+
+// Packets sitting in a chain that a newer packet may still replace.
+const supersedablePending = new Map<string, string>(); // supersedeKey -> packet id
+const supersededPacketIds = new Set<string>();
 
 // ---------------------------------------------------------------------------
 // Store implementation
@@ -265,7 +312,42 @@ export const useQueueStore = create<QueueStore>()((set, get) => {
 
   function processReliable(packet: QueuePacket) {
     set((state) => ({ inflight: [...state.inflight, packet] }));
-    void processPacket(packet);
+
+    // A newer packet for the same scope retires the one still waiting in the chain.
+    const key = supersedeKey(packet);
+    if (key) {
+      const pendingId = supersedablePending.get(key);
+      if (pendingId) supersededPacketIds.add(pendingId);
+      supersedablePending.set(key, packet.id);
+    }
+
+    // Chain per amp so writes to one device never overlap.
+    const mac = packet.steps[0]?.mac ?? "";
+    const previous = reliableChains.get(mac) ?? Promise.resolve();
+
+    const chained = previous.then(async () => {
+      if (supersededPacketIds.has(packet.id)) {
+        supersededPacketIds.delete(packet.id);
+        const completedAt = Date.now();
+        moveToHistory({
+          ...packet,
+          status: "superseded",
+          completedAt,
+          durationMs: completedAt - packet.createdAt
+        });
+        return;
+      }
+      if (key && supersedablePending.get(key) === packet.id) supersedablePending.delete(key);
+      await processPacket(packet);
+    });
+
+    // Keep the chain alive even if a packet throws, and drop it once idle so the
+    // map doesn't grow unbounded across a long session.
+    const settled = chained.catch(() => undefined);
+    reliableChains.set(mac, settled);
+    void settled.then(() => {
+      if (reliableChains.get(mac) === settled) reliableChains.delete(mac);
+    });
   }
 
   return {

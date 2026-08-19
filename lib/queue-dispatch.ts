@@ -132,7 +132,15 @@ function waitForPacket(packetId: string): Promise<QueuePacket> {
   return new Promise((resolve) => {
     const check = () => {
       const packet = useQueueStore.getState().getPacket(packetId);
-      if (packet && (packet.status === "completed" || packet.status === "failed" || packet.status === "partial")) {
+      if (
+        packet &&
+        (packet.status === "completed" ||
+          packet.status === "failed" ||
+          packet.status === "partial" ||
+          // Replaced by a newer packet for the same scope before it was sent —
+          // a normal outcome of fast clicking, not an error.
+          packet.status === "superseded")
+      ) {
         resolve(packet);
         return;
       }
