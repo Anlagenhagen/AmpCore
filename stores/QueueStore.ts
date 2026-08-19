@@ -321,9 +321,12 @@ export const useQueueStore = create<QueueStore>()((set, get) => {
       supersedablePending.set(key, packet.id);
     }
 
-    // Chain per amp so writes to one device never overlap.
-    const mac = packet.steps[0]?.mac ?? "";
-    const previous = reliableChains.get(mac) ?? Promise.resolve();
+    // Chain per amp so writes to one device never overlap. A packet may span
+    // several amps (Toolbox groups), so it waits for — and then occupies — the
+    // chain of every amp it touches; otherwise the amps other than the first
+    // would still take overlapping writes.
+    const macs = [...new Set(packet.steps.map((s) => s.mac))].sort();
+    const previous = Promise.all(macs.map((m) => reliableChains.get(m) ?? Promise.resolve()));
 
     const chained = previous.then(async () => {
       if (supersededPacketIds.has(packet.id)) {
@@ -344,9 +347,9 @@ export const useQueueStore = create<QueueStore>()((set, get) => {
     // Keep the chain alive even if a packet throws, and drop it once idle so the
     // map doesn't grow unbounded across a long session.
     const settled = chained.catch(() => undefined);
-    reliableChains.set(mac, settled);
+    for (const m of macs) reliableChains.set(m, settled);
     void settled.then(() => {
-      if (reliableChains.get(mac) === settled) reliableChains.delete(mac);
+      for (const m of macs) if (reliableChains.get(m) === settled) reliableChains.delete(m);
     });
   }
 
