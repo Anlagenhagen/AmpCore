@@ -37,7 +37,7 @@ import {
   type SpeakerApplyPolicy
 } from "@/lib/speaker-apply-policy";
 import { useAmpActions } from "@/hooks/useAmpActions";
-import { useAmpStore } from "@/stores/AmpStore";
+import { useAmpStore, type ChannelParams } from "@/stores/AmpStore";
 import { useI18n } from "@/components/layout/i18n-provider";
 import { waitForFreshChannelData } from "@/lib/wait-for-fresh-channel-data";
 import {
@@ -48,6 +48,9 @@ import {
   validateChannelSync,
   type ChannelSyncResult
 } from "@/lib/speaker-sync-hash";
+
+/** Stable empty fallback for the store selector below — see the note there. */
+const EMPTY_CHANNELS: ChannelParams["channels"] = [];
 
 type QueuedApplyItem = {
   model: string;
@@ -203,8 +206,15 @@ export function SpeakerControlBar({ scope, channelCount = 4 }: SpeakerControlBar
   // Amp actions for post-apply operations
   const { muteOut, noiseGateOut, setTrimOut, setBridgePair, setAllBridgePairs, renameOutput } = useAmpActions();
 
-  // Live sync status — derived from store data, recomputes on every poller tick
-  const liveChannels = useAmpStore((state) => state.amps.find((a) => a.mac === scope)?.channelParams?.channels ?? []);
+  // Live sync status — derived from store data, recomputes on every poller tick.
+  // The fallback MUST be a stable reference: zustand feeds this selector to
+  // useSyncExternalStore, which compares snapshots by identity. A fresh `[]`
+  // literal here looks like a new snapshot on every check, so React re-renders
+  // forever and dies with "Maximum update depth exceeded" — which in the packaged
+  // app surfaced as a blank "This page couldn't load" window.
+  const liveChannels = useAmpStore(
+    (state) => state.amps.find((a) => a.mac === scope)?.channelParams?.channels ?? EMPTY_CHANNELS
+  );
   const syncResults = useMemo(
     () => (liveChannels.length > 0 ? validateAllChannelsSync(liveChannels) : null),
     [liveChannels]
