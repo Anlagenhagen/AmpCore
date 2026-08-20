@@ -155,6 +155,37 @@ function createMainWindow() {
     }
   };
 
+  // Recover from a failed navigation instead of leaving the user stranded on
+  // Chrome's "This page couldn't load" page, which never retries by itself.
+  // The Next server runs inside THIS process, so if the event loop is busy at
+  // load time — e.g. the restored project points at amps that no longer answer,
+  // and every poll to them has to run into its timeout — the navigation can fail
+  // even though the server itself is fine seconds later.
+  let reloadAttempts = 0;
+  const MAX_RELOAD_ATTEMPTS = 10;
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame) return;
+    // -3 = ERR_ABORTED: a navigation we replaced ourselves, not a failure.
+    if (errorCode === -3) return;
+    if (reloadAttempts >= MAX_RELOAD_ATTEMPTS) {
+      console.error(`Giving up reloading after ${reloadAttempts} attempts: ${errorDescription} (${validatedURL})`);
+      return;
+    }
+    reloadAttempts += 1;
+    const delayMs = Math.min(500 * reloadAttempts, 3000);
+    console.error(`Load failed (${errorDescription}), retry ${reloadAttempts}/${MAX_RELOAD_ATTEMPTS} in ${delayMs}ms`);
+    setTimeout(() => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.loadURL(`http://localhost:${PORT}`).catch(() => {
+        // Swallowed on purpose: the next did-fail-load drives the next retry.
+      });
+    }, delayMs);
+  });
+
+  mainWindow.webContents.on("did-finish-load", () => {
+    reloadAttempts = 0;
+  });
+
   mainWindow.on("maximize", emitWindowState);
   mainWindow.on("unmaximize", emitWindowState);
   mainWindow.on("enter-full-screen", emitWindowState);
