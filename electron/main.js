@@ -321,18 +321,31 @@ app.whenReady().then(() => {
 
       if (!mainWindow || mainWindow.isDestroyed()) return;
 
-      try {
-        await mainWindow.loadURL(url);
-      } catch (firstLoadErr) {
-        // If JS execution fails, fall back to immediate navigation.
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          try {
-            await mainWindow.loadURL(url);
-          } catch (secondLoadErr) {
-            console.error("Failed to load app URL:", secondLoadErr || firstLoadErr);
-            throw secondLoadErr || firstLoadErr;
+      // Retry with a short backoff instead of twice back-to-back: if the server
+      // is not quite serving yet (e.g. right after a restart, while the previous
+      // instance still holds the port), two immediate attempts both fail in the
+      // same instant and the window is left stranded on Chrome's "This page
+      // couldn't load" page, which never retries by itself.
+      const LOAD_ATTEMPTS = 6;
+      const LOAD_RETRY_MS = 500;
+      let lastLoadErr;
+      for (let attempt = 1; attempt <= LOAD_ATTEMPTS; attempt++) {
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        try {
+          await mainWindow.loadURL(url);
+          lastLoadErr = undefined;
+          break;
+        } catch (loadErr) {
+          lastLoadErr = loadErr;
+          if (attempt < LOAD_ATTEMPTS) {
+            setSplashStatus(`Loading interface... (${attempt + 1}/${LOAD_ATTEMPTS})`);
+            await new Promise((resolve) => setTimeout(resolve, LOAD_RETRY_MS));
           }
         }
+      }
+      if (lastLoadErr) {
+        console.error("Failed to load app URL:", lastLoadErr);
+        throw lastLoadErr;
       }
 
       await waitForMainWindowReady();
