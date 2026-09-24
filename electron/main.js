@@ -6,7 +6,7 @@ const path = require("path");
 const http = require("http");
 const { name: packageName, version: packageVersion } = require("../package.json");
 
-const PORT = 3000;
+const PORT = process.env.ELECTRON_DEV ? 3000 : 3002;
 const MIN_SPLASH_MS = 900;
 const MAIN_READY_TIMEOUT_MS = 12000;
 const isDev = !!process.env.ELECTRON_DEV;
@@ -33,7 +33,7 @@ if (!gotSingleInstanceLock) {
  * Bring the app back to a usable window, rebuilding it if the old one died.
  *
  * If the renderer crashes or is killed, the main process survives — it still
- * holds port 3000 and the single-instance lock — but the window is dead. Merely
+ * holds its local server port and the single-instance lock — but the window is dead. Merely
  * focusing it then does nothing, and because the lock is held, launching the app
  * again quits immediately: the user is stuck with a broken window and no way
  * back in short of killing the process. So recreate/reload instead of focusing.
