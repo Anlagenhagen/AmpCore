@@ -37,6 +37,23 @@ import { parseSpeakerData, detectSpeakerVariant, writeSpeakerNameIntoBlob } from
 
 export const dynamic = "force-dynamic";
 
+/**
+ * Every FC=57 variant (YCST/115/116/Phonic/117/Tecnare) starts with a 32-byte
+ * `deviceName` field. The amp stamps this with ITS OWN identity string on store —
+ * confirmed by reading back a preset captured on one amp model and applied to a
+ * different one: only these 32 bytes differed, the entire rest of the block
+ * (the actual EQ/crossover/limiter/delay preset content) matched exactly. Comparing
+ * this field would falsely flag a correctly-applied preset as failed whenever it's
+ * pasted onto a different physical amp than the one it was captured on.
+ */
+const DEVICE_NAME_FIELD_LEN = 32;
+
+function speakerDataContentEquals(readBack: Buffer, sent: Buffer): boolean {
+  if (readBack.length !== sent.length) return false;
+  const skip = Math.min(DEVICE_NAME_FIELD_LEN, sent.length);
+  return readBack.subarray(skip).equals(sent.subarray(skip));
+}
+
 export async function GET(request: Request): Promise<Response> {
   const url = new URL(request.url);
   const mac = url.searchParams.get("mac");
@@ -182,17 +199,20 @@ export async function POST(request: Request): Promise<Response> {
       try {
         const channelMask = 1 << ch;
 
+        const doSend = () =>
+          ampController.sendFC(
+            mac,
+            FuncCode.SPEAKER_DATA,
+            0, // chx=0 — channel encoded in link bitmask
+            body,
+            1, // inOutFlag = Output
+            channelMask, // link = channel bitmask
+            0, // statusCode = 0 (Response/inject)
+            10 // retained for API compatibility; send pacing is ACK-driven
+          );
+
         // Send via persistent socket with original ACK-paced fragmentation.
-        const sendMeta = await ampController.sendFC(
-          mac,
-          FuncCode.SPEAKER_DATA,
-          0, // chx=0 — channel encoded in link bitmask
-          body,
-          1, // inOutFlag = Output
-          channelMask, // link = channel bitmask
-          0, // statusCode = 0 (Response/inject)
-          10 // retained for API compatibility; send pacing is ACK-driven
-        );
+        let sendMeta = await doSend();
 
         // Give the amp ~500ms to process (original takes ~420ms based on Wireshark)
         await new Promise<void>((resolve) => setTimeout(resolve, 500));
@@ -200,12 +220,32 @@ export async function POST(request: Request): Promise<Response> {
         let verified: boolean | null = null; // null = not checked (QoS disabled)
 
         if (enableQos) {
-          try {
-            const readBack = await ampController.requestFC(mac, FuncCode.SPEAKER_DATA, ch, Buffer.alloc(0), 1, 3000);
-            verified = readBack.length === body.length;
-          } catch {
-            // QoS verification is best-effort and should not fail the write.
-            verified = false;
+          // Byte-for-byte read-back against the exact blob we intended to write —
+          // a length-only check would pass even if the amp stored the wrong preset
+          // content. If it doesn't match yet, resend and re-check a few times
+          // before giving up (the amp occasionally drops the ephemeral-style write).
+          const maxRounds = 3;
+          verified = false;
+          for (let round = 0; round < maxRounds && !verified; round++) {
+            if (round > 0) {
+              sendMeta = await doSend();
+              await new Promise<void>((resolve) => setTimeout(resolve, 500));
+            }
+            try {
+              const readBack = await ampController.requestFC(
+                mac,
+                FuncCode.SPEAKER_DATA,
+                ch,
+                Buffer.alloc(0),
+                1,
+                3000
+              );
+              verified = speakerDataContentEquals(readBack, body);
+            } catch {
+              // QoS verification is best-effort — treat a failed read-back as
+              // "not yet confirmed" and let the retry loop try again.
+              verified = false;
+            }
           }
         }
 

@@ -304,12 +304,71 @@ function buildSourceTypeLabel(key: "analog" | "dante" | "aes3" | "backup", index
 // ---------------------------------------------------------------------------
 
 /**
+ * Resolve the FC=27 channel count.
+ *
+ * The per-channel body is a fixed 515 bytes, but the trailer that follows them
+ * varies in size between firmware versions (e.g. FW 1.1.9 sends a larger trailer
+ * than 1.1.8). Deriving the count from the total buffer length therefore
+ * over-counts on larger-trailer firmware — a 4-channel 1.1.9 amp yields
+ * floor(2687/515)=5, a phantom extra channel that shifts `trailerBase` and every
+ * trailer-relative field (muteIn, analog matrix, priorities, rotary lock).
+ *
+ * When the authoritative channel count from FC=0 discovery (Output_chx) is
+ * available we trust it, clamped to what the buffer can physically hold so the
+ * channel-body reads stay in bounds. Otherwise we fall back to the length-derived
+ * count (unchanged legacy behaviour).
+ */
+function resolveFC27ChannelCount(bufferLength: number, authoritativeChannelCount?: number): number {
+  const bodies = resolveFC27BodyCount(bufferLength);
+  if (authoritativeChannelCount && authoritativeChannelCount > 0) {
+    return bodies > 0 ? Math.min(authoritativeChannelCount, bodies) : authoritativeChannelCount;
+  }
+  return bodies;
+}
+
+/**
+ * How many 515-byte channel bodies precede the trailer.
+ *
+ * This is NOT the number of usable channels: a 2-channel DSP-3302D still sends
+ * four bodies (the last two are placeholders named "OutC"/"OutD"), so its buffer
+ * is the same 2232 bytes as a 4-channel DSP-2004D. The trailer therefore starts
+ * after four bodies on both — deriving its position from the usable channel
+ * count would land 1030 bytes early, in the middle of a channel body, making
+ * every trailer field (muteIn, analog matrix, priorities, rotary lock) garbage.
+ *
+ * Plain floor(length / 515) is wrong the other way: FW 1.1.9 sends a larger
+ * trailer, so a 4-channel amp's 2687-byte buffer yields 5 and shifts the trailer
+ * 515 bytes late.
+ *
+ * Both cases fall out of one rule — take the largest body count the buffer could
+ * hold whose remainder is still big enough to be a trailer:
+ *   1.1.8, 4 or 2 channels (2232 B): 4 bodies, 172 B trailer  ✓
+ *   1.1.9, 4 channels     (2687 B): 5 would leave 112 B (too small) → 4, 627 B ✓
+ */
+function resolveFC27BodyCount(bufferLength: number): number {
+  const maxBodies = Math.max(0, Math.floor(bufferLength / BYTES_PER_CHANNEL));
+  for (let bodies = maxBodies; bodies > 0; bodies--) {
+    const trailerBytes = bufferLength - bodies * BYTES_PER_CHANNEL;
+    // The trailer must at least cover the per-channel fields we read from it.
+    if (trailerBytes >= TRAILER_ANALOG_MATRIX_REL_OFFSET + bodies) return bodies;
+  }
+  return maxBodies;
+}
+
+/**
  * Parse FC=27 response (N consecutive channel bodies, each 515 bytes)
  *
  * @param hexData - Raw hex string from FC=27 response
+ * @param capabilities - source capabilities for label resolution
+ * @param authoritativeChannelCount - Output_chx from FC=0 discovery (preferred
+ *   over the length-derived count; see resolveFC27ChannelCount)
  * @returns Array of ChannelData objects (one per parsed channel)
  */
-export function parseFC27Channels(hexData: string, capabilities?: SourceCapabilities): ChannelData[] {
+export function parseFC27Channels(
+  hexData: string,
+  capabilities?: SourceCapabilities,
+  authoritativeChannelCount?: number
+): ChannelData[] {
   if (!hexData || hexData.length < 200) {
     return [];
   }
@@ -317,8 +376,11 @@ export function parseFC27Channels(hexData: string, capabilities?: SourceCapabili
   try {
     const buffer = Buffer.from(hexData, "hex");
     const channels: ChannelData[] = [];
-    const channelCount = Math.max(0, Math.floor(buffer.length / BYTES_PER_CHANNEL));
-    const trailerBase = channelCount * BYTES_PER_CHANNEL;
+    const channelCount = resolveFC27ChannelCount(buffer.length, authoritativeChannelCount);
+    // The trailer sits after ALL channel bodies the device sent — on an amp with
+    // fewer usable channels than body slots (2-channel DSP-3302D) that is more
+    // than channelCount, so this must not be derived from the channel count.
+    const trailerBase = resolveFC27BodyCount(buffer.length) * BYTES_PER_CHANNEL;
 
     const analogMatrix = Array.from({ length: channelCount }, (_, ch) => {
       const abs = trailerBase + TRAILER_ANALOG_MATRIX_REL_OFFSET + ch;
@@ -357,15 +419,17 @@ export function parseFC27Channels(hexData: string, capabilities?: SourceCapabili
  * - true/false when the byte is available
  * - undefined when payload is too short or malformed
  */
-export function parseFC27RotaryLock(hexData: string): boolean | undefined {
+export function parseFC27RotaryLock(hexData: string, authoritativeChannelCount?: number): boolean | undefined {
   if (!hexData || hexData.length < 200) {
     return undefined;
   }
 
   try {
     const buffer = Buffer.from(hexData, "hex");
-    const channelCount = Math.max(0, Math.floor(buffer.length / BYTES_PER_CHANNEL));
-    const trailerBase = channelCount * BYTES_PER_CHANNEL;
+    const channelCount = resolveFC27ChannelCount(buffer.length, authoritativeChannelCount);
+    // Same as in parseFC27Channels: the trailer follows every channel body the
+    // device sent, which is not the same as the number of usable channels.
+    const trailerBase = resolveFC27BodyCount(buffer.length) * BYTES_PER_CHANNEL;
     const lockAbs = trailerBase + TRAILER_ROTARY_LOCK_REL_OFFSET;
     const dp1DisplayLockAbs = buffer.length - DP1_DISPLAY_LOCK_FROM_END;
 

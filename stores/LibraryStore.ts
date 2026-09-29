@@ -503,7 +503,10 @@ export const useLibraryStore = create<LibraryStore>((set, get) => ({
         }
       }
 
-      const allOk = results.every((r) => r.sent);
+      // `sent` only means the write left the Mac — with QoS enabled (verified !== null),
+      // require the read-back byte comparison to have passed too, otherwise "ok" would
+      // report success even when the amp ended up with different preset content.
+      const allOk = results.every((r) => r.sent && r.verified !== false);
       set({ applying: false });
       return { ok: allOk, results };
     } catch (err) {

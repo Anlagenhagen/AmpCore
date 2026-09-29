@@ -8,6 +8,7 @@ import { AssignAmpsDialog } from "@/components/dialogs/assign-amps-dialog";
 import { AssignDemoAmpsDialog } from "@/components/dialogs/assign-demo-amps-dialog";
 import { AmpTabs } from "@/components/monitor/amp-tabs";
 import { NoProjectCard } from "@/components/monitor/no-project-card";
+import { GlobalActionSpinner } from "@/components/monitor/global-action-spinner";
 import type { Dictionary } from "@/lib/i18n/dictionaries";
 
 interface MonitorPageProps {
@@ -25,6 +26,7 @@ export function MonitorPage({ dictionary }: MonitorPageProps) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col space-y-4">
+      <GlobalActionSpinner />
       {selectedProject && (
         <section className="rounded-lg border border-border/50 bg-card/30 px-4 py-3 sm:px-5">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">

@@ -13,6 +13,9 @@ const isDev = !!process.env.ELECTRON_DEV;
 
 let mainWindow;
 let splashWindow;
+// Set once the app is genuinely shutting down, so teardown of the renderer is
+// not mistaken for a crash worth recovering from.
+let isQuitting = false;
 let server;
 
 function getSpeakerLibraryDir() {
@@ -26,11 +29,45 @@ if (!gotSingleInstanceLock) {
   app.quit();
 }
 
+/**
+ * Bring the app back to a usable window, rebuilding it if the old one died.
+ *
+ * If the renderer crashes or is killed, the main process survives — it still
+ * holds its local server port and the single-instance lock — but the window is dead. Merely
+ * focusing it then does nothing, and because the lock is held, launching the app
+ * again quits immediately: the user is stuck with a broken window and no way
+ * back in short of killing the process. So recreate/reload instead of focusing.
+ */
+function restoreMainWindow() {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createMainWindow();
+    mainWindow.loadURL(`http://localhost:${PORT}`).catch((err) => {
+      console.error("Failed to reload app URL after window loss:", err);
+    });
+    mainWindow.show();
+    return;
+  }
+
+  const wc = mainWindow.webContents;
+  if (!wc || wc.isDestroyed() || wc.isCrashed()) {
+    mainWindow.loadURL(`http://localhost:${PORT}`).catch((err) => {
+      console.error("Failed to reload app URL after renderer loss:", err);
+    });
+  }
+
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  if (!mainWindow.isVisible()) mainWindow.show();
+  mainWindow.focus();
+}
+
 app.on("second-instance", () => {
-  const targetWindow = mainWindow && !mainWindow.isDestroyed() ? mainWindow : splashWindow;
-  if (!targetWindow || targetWindow.isDestroyed()) return;
-  if (targetWindow.isMinimized()) targetWindow.restore();
-  targetWindow.focus();
+  // Splash is only meaningful while it still exists and the main window doesn't.
+  if ((!mainWindow || mainWindow.isDestroyed()) && splashWindow && !splashWindow.isDestroyed()) {
+    if (splashWindow.isMinimized()) splashWindow.restore();
+    splashWindow.focus();
+    return;
+  }
+  restoreMainWindow();
 });
 
 // --- Server ---------------------------------------------------------------
@@ -154,6 +191,52 @@ function createMainWindow() {
       }
     }
   };
+
+  // Recover from a failed navigation instead of leaving the user stranded on
+  // Chrome's "This page couldn't load" page, which never retries by itself.
+  // The Next server runs inside THIS process, so if the event loop is busy at
+  // load time — e.g. the restored project points at amps that no longer answer,
+  // and every poll to them has to run into its timeout — the navigation can fail
+  // even though the server itself is fine seconds later.
+  let reloadAttempts = 0;
+  const MAX_RELOAD_ATTEMPTS = 10;
+  mainWindow.webContents.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame) return;
+    // -3 = ERR_ABORTED: a navigation we replaced ourselves, not a failure.
+    if (errorCode === -3) return;
+    if (reloadAttempts >= MAX_RELOAD_ATTEMPTS) {
+      console.error(`Giving up reloading after ${reloadAttempts} attempts: ${errorDescription} (${validatedURL})`);
+      return;
+    }
+    reloadAttempts += 1;
+    const delayMs = Math.min(500 * reloadAttempts, 3000);
+    console.error(`Load failed (${errorDescription}), retry ${reloadAttempts}/${MAX_RELOAD_ATTEMPTS} in ${delayMs}ms`);
+    setTimeout(() => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.loadURL(`http://localhost:${PORT}`).catch(() => {
+        // Swallowed on purpose: the next did-fail-load drives the next retry.
+      });
+    }, delayMs);
+  });
+
+  mainWindow.webContents.on("did-finish-load", () => {
+    reloadAttempts = 0;
+  });
+
+  // If the renderer dies (crash, OOM, or killed from outside), the main process
+  // keeps running with a dead window. Reload it rather than leaving a shell the
+  // user cannot recover — relaunching would hit the single-instance lock.
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    // "clean-exit" is a normal teardown, e.g. while the app itself is quitting.
+    if (details.reason === "clean-exit" || isQuitting) return;
+    console.error(`Renderer gone (${details.reason}), reloading window`);
+    setTimeout(() => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      mainWindow.loadURL(`http://localhost:${PORT}`).catch((err) => {
+        console.error("Failed to reload after renderer loss:", err);
+      });
+    }, 500);
+  });
 
   mainWindow.on("maximize", emitWindowState);
   mainWindow.on("unmaximize", emitWindowState);
@@ -321,18 +404,31 @@ app.whenReady().then(() => {
 
       if (!mainWindow || mainWindow.isDestroyed()) return;
 
-      try {
-        await mainWindow.loadURL(url);
-      } catch (firstLoadErr) {
-        // If JS execution fails, fall back to immediate navigation.
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          try {
-            await mainWindow.loadURL(url);
-          } catch (secondLoadErr) {
-            console.error("Failed to load app URL:", secondLoadErr || firstLoadErr);
-            throw secondLoadErr || firstLoadErr;
+      // Retry with a short backoff instead of twice back-to-back: if the server
+      // is not quite serving yet (e.g. right after a restart, while the previous
+      // instance still holds the port), two immediate attempts both fail in the
+      // same instant and the window is left stranded on Chrome's "This page
+      // couldn't load" page, which never retries by itself.
+      const LOAD_ATTEMPTS = 6;
+      const LOAD_RETRY_MS = 500;
+      let lastLoadErr;
+      for (let attempt = 1; attempt <= LOAD_ATTEMPTS; attempt++) {
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        try {
+          await mainWindow.loadURL(url);
+          lastLoadErr = undefined;
+          break;
+        } catch (loadErr) {
+          lastLoadErr = loadErr;
+          if (attempt < LOAD_ATTEMPTS) {
+            setSplashStatus(`Loading interface... (${attempt + 1}/${LOAD_ATTEMPTS})`);
+            await new Promise((resolve) => setTimeout(resolve, LOAD_RETRY_MS));
           }
         }
+      }
+      if (lastLoadErr) {
+        console.error("Failed to load app URL:", lastLoadErr);
+        throw lastLoadErr;
       }
 
       await waitForMainWindowReady();
@@ -349,6 +445,10 @@ app.whenReady().then(() => {
         );
       }
     });
+});
+
+app.on("before-quit", () => {
+  isQuitting = true;
 });
 
 app.on("window-all-closed", () => {

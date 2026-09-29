@@ -31,6 +31,7 @@ import type { LinkScope } from "@/lib/amp-action-linking";
 import { useAmpStore } from "@/stores/AmpStore";
 import { rmsToPeakVoltage } from "@/lib/generic";
 import { dispatch, dispatchLinked } from "@/lib/queue-dispatch";
+import { beginEqIntent, endEqIntent, mergeWithEqIntent } from "@/lib/eq-intent";
 import type { EqBand } from "@/stores/AmpStore";
 
 // ---------------------------------------------------------------------------
@@ -100,7 +101,12 @@ interface AmpActionsHook {
   invertPolarityOut: (mac: string, channel: Channel, inverted: boolean) => Promise<void>;
   noiseGateOut: (mac: string, channel: Channel, enabled: boolean) => Promise<void>;
   renameInput: (mac: string, channel: Channel, name: string) => Promise<void>;
-  renameOutput: (mac: string, channel: Channel, name: string) => Promise<void>;
+  renameOutput: (
+    mac: string,
+    channel: Channel,
+    name: string,
+    opts?: { suppressToast?: boolean; throwOnError?: boolean }
+  ) => Promise<void>;
   rmsLimiterOut: (mac: string, channel: Channel, enabled: boolean, params?: RmsLimiterParams) => Promise<void>;
   setRmsLimiterAttack: (
     mac: string,
@@ -180,6 +186,14 @@ const AMP_ACTIONS_ENDPOINT = "/api/amp-actions";
 
 function getRatedRmsV(mac: string) {
   return useAmpStore.getState().amps.find((a) => a.mac === mac)?.ratedRmsV;
+}
+
+/** The EQ bands the poller last reported — the base the EQ panel builds blocks from. */
+function polledEqBands(mac: string, channel: number, target: CrossoverTarget): EqBand[] | null {
+  const chan = useAmpStore.getState().amps.find((a) => a.mac === mac)?.channelParams?.channels[channel];
+  if (!chan) return null;
+  const bands = target === "input" ? chan.eqIn : chan.eqOut;
+  return Array.isArray(bands) ? bands : null;
 }
 
 /** Dispatch a single action to one amp/channel (no linking). */
@@ -664,7 +678,14 @@ function createAmpActions(): AmpActionsHook {
       return;
     }
 
-    const normalizedBands = bands.map((band, idx) => {
+    // The panel builds this block from polled amp data, so when several bands are
+    // clicked faster than the poll updates, each block still carries the previous
+    // band's OLD value and would revert it. Carry the touched band(s) over onto
+    // the block we last asked for instead. See lib/eq-intent.ts.
+    const scope = { mac, channel, target };
+    const effectiveBands = mergeWithEqIntent(scope, bands, polledEqBands(mac, channel, target));
+
+    const normalizedBands = effectiveBands.map((band, idx) => {
       const isHpLp = idx === 0 || idx === 9;
       const clampedType = Number.isInteger(band.type) ? Math.max(0, Math.min(10, band.type)) : 0;
       const clampedFreq = Math.max(CROSSOVER_FREQ_MIN_HZ, Math.min(CROSSOVER_FREQ_MAX_HZ, band.freq));
@@ -680,15 +701,20 @@ function createAmpActions(): AmpActionsHook {
       };
     });
 
-    await sendWithLinking(
-      "useAmpActions.applyEqBlock",
-      mac,
-      "eqBlock",
-      channel,
-      0,
-      target === "input" ? "inputEq" : "outputEq",
-      { target, bands: normalizedBands }
-    );
+    beginEqIntent(scope, normalizedBands);
+    try {
+      await sendWithLinking(
+        "useAmpActions.applyEqBlock",
+        mac,
+        "eqBlock",
+        channel,
+        0,
+        target === "input" ? "inputEq" : "outputEq",
+        { target, bands: normalizedBands }
+      );
+    } finally {
+      endEqIntent(scope);
+    }
   };
 
   const setEqBandFreq = async (mac: string, channel: Channel, target: CrossoverTarget, band: number, hz: number) => {
@@ -736,10 +762,15 @@ function createAmpActions(): AmpActionsHook {
     await sendSingle("useAmpActions.renameInput", mac, "renameInput", channel, trimmed);
   };
 
-  const renameOutput = async (mac: string, channel: Channel, name: string) => {
+  const renameOutput = async (
+    mac: string,
+    channel: Channel,
+    name: string,
+    opts?: { suppressToast?: boolean; throwOnError?: boolean }
+  ) => {
     const trimmed = name.trim().slice(0, CHANNEL_NAME_MAX_LENGTH);
     if (!trimmed) return;
-    await sendSingle("useAmpActions.renameOutput", mac, "renameOutput", channel, trimmed);
+    await sendSingle("useAmpActions.renameOutput", mac, "renameOutput", channel, trimmed, undefined, opts);
   };
 
   return {
