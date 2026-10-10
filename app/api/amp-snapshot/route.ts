@@ -30,8 +30,30 @@ const REREAD_DELAY_MS = 120;
 /** Per-read timeout for FC=57; the payload can be 2.4 kB across six fragments. */
 const SPEAKER_READ_TIMEOUT_MS = 3000;
 
+/** FC=27 layout: one 515-byte body per channel slot, then a firmware trailer. */
+const FC27_BODY_LEN = 515;
+/** Trailer sizes seen on real hardware: FW 1.1.8 = 172 B, FW 1.1.9 = 627 B. */
+const FC27_KNOWN_TRAILERS = [172, 627];
+
 const sha256 = (hex: string) => createHash("sha256").update(hex, "hex").digest("hex");
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Hard upper bound for one read, including the controller's own retry.
+ *
+ * The controller waits for its socket before sending; if the port could not be
+ * bound (another program holds 45454), that wait never ends. A snapshot must
+ * fail visibly instead of leaving the dialog on "reading…" forever.
+ */
+const HARD_READ_LIMIT_MS = 10_000;
+
+function withHardLimit<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`No answer within ${HARD_READ_LIMIT_MS / 1000} s`)), HARD_READ_LIMIT_MS);
+  });
+  return Promise.race([promise, limit]).finally(() => clearTimeout(timer));
+}
 
 /**
  * Read a block twice and report whether both reads agree.
@@ -43,7 +65,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 async function readTwice(read: () => Promise<Buffer>): Promise<SnapshotBlock> {
   let first: Buffer;
   try {
-    first = await read();
+    first = await withHardLimit(read());
   } catch (err) {
     return {
       hex: "",
@@ -65,7 +87,7 @@ async function readTwice(read: () => Promise<Buffer>): Promise<SnapshotBlock> {
   await sleep(REREAD_DELAY_MS);
 
   try {
-    const second = await read();
+    const second = await withHardLimit(read());
     block.readVerified = second.equals(first);
     if (!block.readVerified) {
       block.error = `Two consecutive reads differ (${first.length} B vs ${second.length} B) — value not trustworthy`;
@@ -75,6 +97,29 @@ async function readTwice(read: () => Promise<Buffer>): Promise<SnapshotBlock> {
   }
 
   return block;
+}
+
+/**
+ * Reject a block whose length cannot be a complete payload.
+ *
+ * Two identical reads prove the transfer was stable, not that it was complete:
+ * if the amp always stops after the same fragment, both reads agree on a
+ * truncated block. The length check closes that gap. A failed check keeps the
+ * bytes but marks the block unverified, so a restore refuses it.
+ */
+function requirePlausibleLength(block: SnapshotBlock, plausible: boolean, what: string): void {
+  if (!block.hex || plausible) return;
+  block.readVerified = false;
+  block.error = `${what}: unexpected length ${block.byteLength} B — possibly incomplete`;
+}
+
+function isPlausibleFC27Length(byteLength: number, outputChannels: number): boolean {
+  // 2-channel amps still send four body slots, so try every slot count from
+  // the channel count up to 8 against the known trailer sizes.
+  for (let slots = Math.max(1, outputChannels); slots <= 8; slots++) {
+    if (FC27_KNOWN_TRAILERS.includes(byteLength - slots * FC27_BODY_LEN)) return true;
+  }
+  return false;
 }
 
 async function captureAmp(mac: string): Promise<SnapshotAmp> {
@@ -103,6 +148,11 @@ async function captureAmp(mac: string): Promise<SnapshotAmp> {
   // carries fields the parser does not surface yet (bridges @34/35,
   // standby @32, rotary lock @33).
   base.channelData = await readTwice(() => ampController.requestFC27(mac, 0));
+  requirePlausibleLength(
+    base.channelData,
+    isPlausibleFC27Length(base.channelData.byteLength, outputChannels),
+    "Channel data (FC=27)"
+  );
 
   if (base.channelData.hex) {
     try {
@@ -143,11 +193,11 @@ async function captureAmp(mac: string): Promise<SnapshotAmp> {
       channel: ch,
       variant: block.byteLength ? detectSpeakerVariant(block.byteLength) : "unknown"
     };
+    requirePlausibleLength(speakerBlock, speakerBlock.variant !== "unknown", `Speaker block CH${ch + 1} (FC=57)`);
     base.speakerData.push(speakerBlock);
   }
 
-  base.fullyVerified =
-    base.channelData.readVerified && base.speakerData.every((block) => block.readVerified);
+  base.fullyVerified = base.channelData.readVerified && base.speakerData.every((block) => block.readVerified);
 
   return base;
 }

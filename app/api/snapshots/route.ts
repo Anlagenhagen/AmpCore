@@ -11,6 +11,7 @@
  *   DELETE /api/snapshots?id=…&projectId=…  delete one
  */
 
+import { createHash } from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import type { ProjectSnapshot } from "@/lib/types/amp-snapshot";
@@ -27,6 +28,40 @@ function sanitizeId(value: string): string {
   return value.replace(/[^a-zA-Z0-9_-]/g, "_");
 }
 
+/**
+ * Re-check every stored block against its SHA-256.
+ *
+ * A snapshot file passes through disk, iCloud, NAS copies and hand-picked
+ * imports. Any of those can damage it, and a damaged speaker block written to
+ * an amp is worse than no restore at all. Returns one line per problem; an
+ * empty list means every block is byte-identical to what was captured.
+ */
+function checkIntegrity(snapshot: ProjectSnapshot): string[] {
+  const problems: string[] = [];
+  if (snapshot?.schemaVersion !== 1) problems.push(`Unknown schema version ${String(snapshot?.schemaVersion)}`);
+  if (!Array.isArray(snapshot?.amps)) return [...problems, "No amp list in snapshot"];
+
+  for (const amp of snapshot.amps) {
+    const label = amp?.name || amp?.mac || "?";
+    const blocks = [
+      { what: "channel data", block: amp?.channelData },
+      ...(Array.isArray(amp?.speakerData) ? amp.speakerData : []).map((b) => ({
+        what: `speaker CH${(b?.channel ?? 0) + 1}`,
+        block: b
+      }))
+    ];
+    for (const { what, block } of blocks) {
+      if (!block || typeof block.hex !== "string" || !block.hex) continue;
+      const valid =
+        /^[0-9a-fA-F]*$/.test(block.hex) &&
+        block.hex.length === block.byteLength * 2 &&
+        createHash("sha256").update(block.hex, "hex").digest("hex") === block.sha256;
+      if (!valid) problems.push(`${label} ${what}: checksum mismatch — file damaged or edited`);
+    }
+  }
+  return problems;
+}
+
 /** Metadata shown in the list, without the (large) payload. */
 function toSummary(snapshot: ProjectSnapshot, byteLength: number) {
   return {
@@ -37,6 +72,7 @@ function toSummary(snapshot: ProjectSnapshot, byteLength: number) {
     projectName: snapshot.projectName,
     ampCount: snapshot.amps?.length ?? 0,
     fullyVerified: snapshot.fullyVerified,
+    integrityOk: checkIntegrity(snapshot).length === 0,
     byteLength
   };
 }
@@ -55,7 +91,8 @@ export async function GET(request: Request): Promise<Response> {
   if (id) {
     try {
       const raw = await fs.readFile(path.join(dir, `${sanitizeId(id)}.json`), "utf8");
-      return Response.json({ success: true, snapshot: JSON.parse(raw) as ProjectSnapshot });
+      const snapshot = JSON.parse(raw) as ProjectSnapshot;
+      return Response.json({ success: true, snapshot, integrityProblems: checkIntegrity(snapshot) });
     } catch (err) {
       return Response.json(
         { error: `Snapshot not readable: ${err instanceof Error ? err.message : String(err)}` },
@@ -97,6 +134,13 @@ export async function POST(request: Request): Promise<Response> {
 
   if (!snapshot?.projectId || !snapshot?.id) {
     return Response.json({ error: "Snapshot needs projectId and id" }, { status: 400 });
+  }
+
+  // Refuse to store a damaged snapshot (mainly: a broken import file), so the
+  // list never offers something a restore would have to reject later.
+  const problems = checkIntegrity(snapshot);
+  if (problems.length > 0) {
+    return Response.json({ error: problems.join("; "), integrityProblems: problems }, { status: 422 });
   }
 
   try {

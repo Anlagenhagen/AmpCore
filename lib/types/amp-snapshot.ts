@@ -64,8 +64,9 @@ export interface SnapshotAmp {
   speakerData: SnapshotSpeakerBlock[];
 
   /**
-   * Parsed view for display and diffing. Derived from `channelData`; never
-   * restored from, so a parser change cannot corrupt a restore.
+   * Parsed view of `channelData`, used for the preview diff and for the
+   * individual level/routing/name writes. Those writes are only allowed when
+   * `channelData.readVerified` is true.
    */
   parsed?: {
     channels: Array<{

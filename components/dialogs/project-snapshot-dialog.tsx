@@ -23,12 +23,7 @@ import { useI18n } from "@/components/layout/i18n-provider";
 import { useAmpActions } from "@/hooks/useAmpActions";
 import { useAmpStore } from "@/stores/AmpStore";
 import { useProjectStore } from "@/stores/ProjectStore";
-import {
-  buildDefaultMapping,
-  executeRestore,
-  planRestore,
-  type RestoreStepResult
-} from "@/lib/snapshot-restore";
+import { buildDefaultMapping, executeRestore, planRestore, type RestoreStepResult } from "@/lib/snapshot-restore";
 import { DEFAULT_RESTORE_OPTIONS, type ProjectSnapshot, type RestoreOptions } from "@/lib/types/amp-snapshot";
 
 interface SnapshotSummary {
@@ -37,7 +32,25 @@ interface SnapshotSummary {
   note: string;
   ampCount: number;
   fullyVerified: boolean;
+  integrityOk?: boolean;
   byteLength: number;
+}
+
+/** One line per block that was not confirmed, e.g. "DSP-3004 · speaker CH2: …". */
+function listUnverified(amps: ProjectSnapshot["amps"]): string[] {
+  const lines: string[] = [];
+  for (const amp of amps) {
+    const label = amp.name || amp.mac;
+    if (!amp.channelData.readVerified) {
+      lines.push(`${label} · channel data: ${amp.channelData.error ?? "not confirmed"}`);
+    }
+    for (const block of amp.speakerData) {
+      if (!block.readVerified) {
+        lines.push(`${label} · speaker CH${block.channel + 1}: ${block.error ?? "not confirmed"}`);
+      }
+    }
+  }
+  return lines;
 }
 
 const formatSize = (bytes: number) =>
@@ -62,6 +75,8 @@ export function ProjectSnapshotDialog() {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState("");
   const [list, setList] = useState<SnapshotSummary[]>([]);
+  const [captureProblems, setCaptureProblems] = useState<string[]>([]);
+  const [integrityProblems, setIntegrityProblems] = useState<string[]>([]);
 
   const [loaded, setLoaded] = useState<ProjectSnapshot | null>(null);
   const [mapping, setMapping] = useState<ReturnType<typeof buildDefaultMapping>>({});
@@ -76,9 +91,14 @@ export function ProjectSnapshotDialog() {
   }, [amps, selectedProject]);
 
   const liveIndex = useMemo(() => {
-    const out: Record<string, { name: string; channelParams?: (typeof amps)[number]["channelParams"]; outputChannels: number }> =
-      {};
+    const out: Record<
+      string,
+      { name: string; channelParams?: (typeof amps)[number]["channelParams"]; outputChannels: number }
+    > = {};
+    // Only reachable amps are restore targets; an offline amp in the list
+    // makes planRestore report "not reachable" instead of attempting writes.
     for (const amp of projectAmps) {
+      if (!amp.reachable) continue;
       out[amp.mac] = {
         name: amp.name ?? amp.lastKnownName ?? amp.mac,
         channelParams: amp.channelParams,
@@ -105,15 +125,21 @@ export function ProjectSnapshotDialog() {
 
   // --- Capture --------------------------------------------------------------
 
+  // Every amp assigned to the project, online or not. An amp that is offline
+  // right now must show up in the snapshot as a failed read, not silently
+  // disappear from "all amps of the project".
+  const assignedMacs = useMemo(() => (selectedProject?.assigned_amps ?? []).map((a) => a.mac), [selectedProject]);
+
   const handleCapture = async () => {
-    if (!selectedProject || projectAmps.length === 0) return;
+    if (!selectedProject || assignedMacs.length === 0) return;
     setBusy(true);
     setProgress(t.capturing);
+    setCaptureProblems([]);
     try {
       const res = await fetch("/api/amp-snapshot", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ macs: projectAmps.map((a) => a.mac) })
+        body: JSON.stringify({ macs: assignedMacs })
       });
       const data = (await res.json()) as {
         success?: boolean;
@@ -130,7 +156,16 @@ export function ProjectSnapshotDialog() {
         note: note.trim(),
         projectId: selectedProject.id,
         projectName: selectedProject.name,
-        amps: data.amps,
+        // An amp that is offline right now has no discovery name; label it with
+        // the name the app last saw, so the snapshot stays readable later.
+        amps: data.amps.map((a) => ({
+          ...a,
+          name:
+            a.name ||
+            amps.find((x) => x.mac.toUpperCase() === a.mac.toUpperCase())?.lastKnownName ||
+            amps.find((x) => x.mac.toUpperCase() === a.mac.toUpperCase())?.customName ||
+            ""
+        })),
         project: {
           ampConstants: Object.fromEntries(
             (selectedProject.assigned_amps ?? []).map((a) => [a.mac, a.constants as unknown])
@@ -149,7 +184,9 @@ export function ProjectSnapshotDialog() {
 
       setNote("");
       await refreshList();
-      if (snapshot.fullyVerified) {
+      const problems = listUnverified(snapshot.amps);
+      setCaptureProblems(problems);
+      if (snapshot.fullyVerified && problems.length === 0) {
         toast.success(t.captureDone, { description: t.verifiedAll });
       } else {
         toast.warning(t.captureDone, { description: t.verifiedPartial });
@@ -170,10 +207,20 @@ export function ProjectSnapshotDialog() {
       const res = await fetch(
         `/api/snapshots?projectId=${encodeURIComponent(selectedProject.id)}&id=${encodeURIComponent(id)}`
       );
-      const data = (await res.json()) as { snapshot?: ProjectSnapshot; error?: string };
-      if (!data.snapshot) throw new Error(data.error ?? "nicht lesbar");
+      const data = (await res.json()) as {
+        snapshot?: ProjectSnapshot;
+        integrityProblems?: string[];
+        error?: string;
+      };
+      if (!data.snapshot) throw new Error(data.error ?? t.notReadable);
+      setIntegrityProblems(data.integrityProblems ?? []);
       setLoaded(data.snapshot);
-      setMapping(buildDefaultMapping(data.snapshot, projectAmps.map((a) => a.mac)));
+      setMapping(
+        buildDefaultMapping(
+          data.snapshot,
+          projectAmps.map((a) => a.mac)
+        )
+      );
       setResults(null);
       setMutedAfter([]);
     } catch (err) {
@@ -190,9 +237,17 @@ export function ProjectSnapshotDialog() {
   const runnableChannels = plan?.channels.filter((c) => c.blockers.length === 0 && c.changes.length > 0) ?? [];
 
   const handleRestore = async () => {
-    if (!loaded || !plan) return;
+    if (!loaded || !plan || integrityProblems.length > 0) return;
     setBusy(true);
     setResults(null);
+    // Remember which outputs were open before we touch anything. "Unmute all"
+    // afterwards must only reopen those — never a channel the user had muted
+    // on purpose before the restore.
+    const openBefore = new Set(
+      runnableChannels
+        .filter((c) => liveIndex[c.targetMac]?.channelParams?.channels?.[c.targetChannel]?.muteOut === false)
+        .map((c) => `${c.targetMac}#${c.targetChannel}`)
+    );
     try {
       const stepResults = await executeRestore(
         plan,
@@ -217,7 +272,10 @@ export function ProjectSnapshotDialog() {
       // Outputs we muted and did not deliberately restore stay muted; the user
       // decides when it gets loud again.
       if (options.muteBeforeWrite && !options.muteStates) {
-        setMutedAfter(runnableChannels.map((c) => ({ mac: c.targetMac, channel: c.targetChannel })));
+        const mutedByUs = stepResults.filter(
+          (r) => r.step === "Mute output" && r.ok && openBefore.has(`${r.targetMac}#${r.targetChannel}`)
+        );
+        setMutedAfter(mutedByUs.map((r) => ({ mac: r.targetMac, channel: r.targetChannel })));
       }
 
       const ok = stepResults.filter((r) => r.ok).length;
@@ -253,10 +311,9 @@ export function ProjectSnapshotDialog() {
 
   const handleDelete = async (id: string) => {
     if (!selectedProject) return;
-    await fetch(
-      `/api/snapshots?projectId=${encodeURIComponent(selectedProject.id)}&id=${encodeURIComponent(id)}`,
-      { method: "DELETE" }
-    );
+    await fetch(`/api/snapshots?projectId=${encodeURIComponent(selectedProject.id)}&id=${encodeURIComponent(id)}`, {
+      method: "DELETE"
+    });
     if (loaded?.id === id) setLoaded(null);
     await refreshList();
   };
@@ -296,12 +353,22 @@ export function ProjectSnapshotDialog() {
                   placeholder={t.notePlaceholder}
                   disabled={busy}
                 />
-                <Button onClick={handleCapture} disabled={busy || projectAmps.length === 0} className="gap-2">
+                <Button onClick={handleCapture} disabled={busy || assignedMacs.length === 0} className="gap-2">
                   <Camera className="h-4 w-4" />
                   {busy ? t.capturing : t.capture}
                 </Button>
               </div>
               {progress && <p className="text-xs text-muted-foreground">{progress}</p>}
+              {captureProblems.length > 0 && (
+                <div className="space-y-1 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2">
+                  <p className="text-xs font-semibold text-destructive">{t.problemsTitle}</p>
+                  {captureProblems.map((line) => (
+                    <p key={line} className="text-xs text-destructive">
+                      {line}
+                    </p>
+                  ))}
+                </div>
+              )}
             </div>
 
             <div className="space-y-2">
@@ -314,7 +381,11 @@ export function ProjectSnapshotDialog() {
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
                       <span className="truncate text-sm font-medium">{s.note || formatWhen(s.createdAt)}</span>
-                      {s.fullyVerified ? (
+                      {s.integrityOk === false ? (
+                        <Badge variant="destructive" className="shrink-0 text-[10px]">
+                          {t.damagedBadge}
+                        </Badge>
+                      ) : s.fullyVerified ? (
                         <Check className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
                       ) : (
                         <Badge variant="destructive" className="shrink-0 text-[10px]">
@@ -383,40 +454,97 @@ export function ProjectSnapshotDialog() {
 
             {loaded && (
               <>
+                {integrityProblems.length > 0 && (
+                  <div className="space-y-1 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2">
+                    <p className="text-xs font-semibold text-destructive">{t.integrityFailed}</p>
+                    {integrityProblems.map((line) => (
+                      <p key={line} className="text-xs text-destructive">
+                        {line}
+                      </p>
+                    ))}
+                  </div>
+                )}
                 <section className="space-y-2">
                   <h3 className="text-sm font-semibold">{t.mappingTitle}</h3>
                   <p className="text-xs text-muted-foreground">{t.mappingHint}</p>
                   {loaded.amps.map((amp) => (
-                    <div key={amp.mac} className="flex items-center gap-2 rounded-md border border-border/60 px-3 py-2">
-                      <div className="min-w-0 flex-1">
-                        <p className="truncate text-sm font-medium">{amp.name || amp.mac}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {amp.mac} · {t.channels.replace("{n}", String(amp.outputChannels))}
-                          {!amp.fullyVerified && ` · ${t.unverifiedBadge}`}
-                        </p>
+                    <div key={amp.mac} className="space-y-2 rounded-md border border-border/60 px-3 py-2">
+                      <div className="flex items-center gap-2">
+                        <div className="min-w-0 flex-1">
+                          <p className="truncate text-sm font-medium">{amp.name || amp.mac}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {amp.mac} · {t.channels.replace("{n}", String(amp.outputChannels))}
+                            {!amp.fullyVerified && ` · ${t.unverifiedBadge}`}
+                          </p>
+                        </div>
+                        <span className="text-muted-foreground">→</span>
+                        <Select
+                          value={mapping[amp.mac]?.targetMac ?? "__none__"}
+                          onValueChange={(v) =>
+                            setMapping((prev) => ({
+                              ...prev,
+                              [amp.mac]: { ...prev[amp.mac], targetMac: v === "__none__" ? null : v }
+                            }))
+                          }
+                        >
+                          <SelectTrigger className="w-56">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="__none__">{t.targetNone}</SelectItem>
+                            {projectAmps.map((a) => (
+                              <SelectItem key={a.mac} value={a.mac}>
+                                {a.name ?? a.lastKnownName ?? a.mac}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
                       </div>
-                      <span className="text-muted-foreground">→</span>
-                      <Select
-                        value={mapping[amp.mac]?.targetMac ?? "__none__"}
-                        onValueChange={(v) =>
-                          setMapping((prev) => ({
-                            ...prev,
-                            [amp.mac]: { ...prev[amp.mac], targetMac: v === "__none__" ? null : v }
-                          }))
-                        }
-                      >
-                        <SelectTrigger className="w-56">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="__none__">{t.targetNone}</SelectItem>
-                          {projectAmps.map((a) => (
-                            <SelectItem key={a.mac} value={a.mac}>
-                              {a.name ?? a.lastKnownName ?? a.mac}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
+                      {mapping[amp.mac]?.targetMac && (
+                        <details className="text-xs">
+                          <summary className="cursor-pointer text-muted-foreground">{t.channelMapping}</summary>
+                          <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                            {Array.from({ length: amp.outputChannels }, (_, src) => {
+                              const targetMac = mapping[amp.mac]?.targetMac ?? "";
+                              const targetChannels = liveIndex[targetMac]?.outputChannels ?? amp.outputChannels;
+                              const current = mapping[amp.mac]?.channelMap[src];
+                              return (
+                                <div key={src} className="flex items-center gap-1">
+                                  <span className="w-9 shrink-0">CH{src + 1}</span>
+                                  <span className="text-muted-foreground">→</span>
+                                  <Select
+                                    value={current === null || current === undefined ? "__none__" : String(current)}
+                                    onValueChange={(v) =>
+                                      setMapping((prev) => ({
+                                        ...prev,
+                                        [amp.mac]: {
+                                          ...prev[amp.mac],
+                                          channelMap: {
+                                            ...prev[amp.mac].channelMap,
+                                            [src]: v === "__none__" ? null : Number(v)
+                                          }
+                                        }
+                                      }))
+                                    }
+                                  >
+                                    <SelectTrigger className="h-7 flex-1 text-xs">
+                                      <SelectValue />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                      <SelectItem value="__none__">—</SelectItem>
+                                      {Array.from({ length: targetChannels }, (_, dst) => (
+                                        <SelectItem key={dst} value={String(dst)}>
+                                          CH{dst + 1}
+                                        </SelectItem>
+                                      ))}
+                                    </SelectContent>
+                                  </Select>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </details>
+                      )}
                     </div>
                   ))}
                 </section>
@@ -458,7 +586,9 @@ export function ProjectSnapshotDialog() {
                     </p>
                   ))}
 
-                  {changeCount === 0 && <p className="text-sm text-muted-foreground">{t.previewEmpty}</p>}
+                  {changeCount === 0 && (plan?.warnings.length ?? 0) === 0 && (
+                    <p className="text-sm text-muted-foreground">{t.previewEmpty}</p>
+                  )}
 
                   <div className="max-h-64 space-y-2 overflow-y-auto">
                     {plan?.channels
@@ -491,7 +621,7 @@ export function ProjectSnapshotDialog() {
                       .filter((r) => !r.ok)
                       .map((r, i) => (
                         <p key={i} className="text-xs text-destructive">
-                          CH{r.targetChannel + 1} {r.step}: {r.error}
+                          {liveIndex[r.targetMac]?.name ?? r.targetMac} · CH{r.targetChannel + 1} {r.step}: {r.error}
                         </p>
                       ))}
                   </section>
@@ -518,7 +648,10 @@ export function ProjectSnapshotDialog() {
         <DialogFooter className="gap-2">
           {progress && <span className="mr-auto text-xs text-muted-foreground">{progress}</span>}
           {tab === "restore" && loaded && (
-            <Button onClick={() => void handleRestore()} disabled={busy || runnableChannels.length === 0}>
+            <Button
+              onClick={() => void handleRestore()}
+              disabled={busy || runnableChannels.length === 0 || integrityProblems.length > 0}
+            >
               {busy ? t.restoring : t.restore}
             </Button>
           )}
@@ -577,15 +710,17 @@ export function ProjectSnapshotDialog() {
       // while keeping the original capture metadata intact.
       parsed.projectId = selectedProject.id;
       parsed.id = `snap-imported-${Date.now()}`;
-      await fetch("/api/snapshots", {
+      const save = await fetch("/api/snapshots", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(parsed)
       });
+      // The server re-checks every block's checksum; a damaged file is refused.
+      if (!save.ok) throw new Error((await save.json())?.error ?? `HTTP ${save.status}`);
       await refreshList();
       toast.success(t.import);
     } catch (err) {
-      toast.error(t.captureFailed, { description: err instanceof Error ? err.message : String(err) });
+      toast.error(t.importFailed, { description: err instanceof Error ? err.message : String(err) });
     }
   }
 

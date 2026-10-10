@@ -495,7 +495,12 @@
       "resultOk": "{ok} von {total} Schritten erfolgreich",
       "cancel": "Abbrechen",
       "close": "Schließen",
-      "channels": "{n} Kanäle"
+      "channels": "{n} Kanäle",
+      "problemsTitle": "Nicht bestätigt — bitte erneut sichern:",
+      "integrityFailed": "Abbild-Datei beschädigt — Zurückspielen gesperrt",
+      "damagedBadge": "beschädigt",
+      "importFailed": "Import fehlgeschlagen",
+      "notReadable": "Abbild nicht lesbar"
     }
   }
 }

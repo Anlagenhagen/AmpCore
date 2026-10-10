@@ -495,7 +495,12 @@
       "resultOk": "{ok} of {total} steps succeeded",
       "cancel": "Cancel",
       "close": "Close",
-      "channels": "{n} channels"
+      "channels": "{n} channels",
+      "problemsTitle": "Not confirmed — please capture again:",
+      "integrityFailed": "Snapshot file damaged — restore blocked",
+      "damagedBadge": "damaged",
+      "importFailed": "Import failed",
+      "notReadable": "Snapshot not readable"
     }
   }
 }

@@ -91,9 +91,7 @@ export function planRestore(
     }
 
     if (!amp.fullyVerified) {
-      warnings.push(
-        `${amp.name || amp.mac}: snapshot was not fully confirmed on read — values may be incomplete.`
-      );
+      warnings.push(`${amp.name || amp.mac}: snapshot was not fully confirmed on read — values may be incomplete.`);
     }
 
     for (const [srcStr, targetChannel] of Object.entries(map.channelMap)) {
@@ -118,16 +116,27 @@ export function planRestore(
       const cur = target.channelParams?.channels?.[targetChannel];
       const speaker = amp.speakerData.find((b) => b.channel === sourceChannel);
 
+      // An unconfirmed read is never written: it may be the truncated or
+      // mixed-up block the double read exists to catch. Re-capture instead.
       if (options.speakerProcessing) {
         if (!speaker?.hex) {
           plan.blockers.push("No speaker block in snapshot");
+        } else if (!speaker.readVerified) {
+          plan.blockers.push(`Speaker block not confirmed on read${speaker.error ? ` (${speaker.error})` : ""}`);
         } else {
           plan.changes.push({
             kind: "speaker",
             label: "EQ, crossover, limiter, delay, polarity, FIR",
-            to: `${speaker.byteLength} Byte (${speaker.variant})${speaker.readVerified ? "" : " — read unverified!"}`
+            to: `${speaker.byteLength} Byte (${speaker.variant})`
           });
         }
+      }
+
+      const usesChannelData = options.levels || options.routing || options.names || options.muteStates;
+      if (usesChannelData && !amp.channelData.readVerified) {
+        plan.blockers.push(
+          `Channel data not confirmed on read${amp.channelData.error ? ` (${amp.channelData.error})` : ""}`
+        );
       }
 
       if (src) {
@@ -266,7 +275,7 @@ async function readSpeakerLength(mac: string, channel: number): Promise<number |
   try {
     const res = await fetch(`/api/amp-speaker-data?mac=${encodeURIComponent(mac)}&channel=${channel}`);
     const data = (await res.json()) as { byteLength?: number };
-    return typeof data.byteLength === "number" ? data.byteLength : null;
+    return res.ok && typeof data.byteLength === "number" && data.byteLength > 0 ? data.byteLength : null;
   } catch {
     return null;
   }
@@ -334,17 +343,28 @@ export async function executeRestore(
 
     if (options.muteBeforeWrite) {
       await record("Mute output", () => actions.muteOut(ch.targetMac, ch.targetChannel, true));
+      // The user asked for writes to happen muted. If the mute did not land,
+      // writing a new crossover into a live channel is exactly what they
+      // wanted to avoid — leave this channel untouched.
+      if (!results[results.length - 1]?.ok) {
+        done += 1;
+        onProgress?.({ done, total, label: ch.targetLabel });
+        continue;
+      }
     }
 
     if (options.speakerProcessing && speaker?.hex) {
       const currentLen = await readSpeakerLength(ch.targetMac, ch.targetChannel);
-      if (currentLen !== null && currentLen !== speaker.byteLength) {
+      if (currentLen === null || currentLen !== speaker.byteLength) {
         results.push({
           targetMac: ch.targetMac,
           targetChannel: ch.targetChannel,
           step: "Speaker block",
           ok: false,
-          error: `Format mismatch: snapshot ${speaker.byteLength} B, device ${currentLen} B — not written`
+          error:
+            currentLen === null
+              ? "Could not read the target's speaker format — not written"
+              : `Format mismatch: snapshot ${speaker.byteLength} B, device ${currentLen} B — not written`
         });
       } else {
         await record("Speaker block", () => writeSpeakerBlock(ch.targetMac, ch.targetChannel, speaker.hex));
