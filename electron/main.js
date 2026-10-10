@@ -18,6 +18,11 @@ let splashWindow;
 let isQuitting = false;
 let server;
 
+function getSnapshotsDir() {
+  const base = process.env.APP_USER_DATA ?? process.cwd();
+  return path.join(base, "storage", "snapshots");
+}
+
 function getSpeakerLibraryDir() {
   const base = process.env.APP_USER_DATA ?? process.cwd();
   return path.join(base, "storage", "speaker-library");
@@ -351,6 +356,56 @@ ipcMain.handle("library:open-config-folder", async () => {
       ok: false,
       error: error instanceof Error ? error.message : String(error)
     };
+  }
+});
+
+/**
+ * Snapshot file handling. Mirrors the speaker-library handlers: the app owns a
+ * folder under APP_USER_DATA, and these give the user a native way to take a
+ * file out of it or bring one in — so a project image can go onto a NAS or a
+ * second machine instead of living only inside the app.
+ */
+ipcMain.handle("snapshot:save-file", async (_event, suggestedName, content) => {
+  if (!mainWindow || mainWindow.isDestroyed()) return { ok: false, error: "No window" };
+  try {
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: "Export snapshot",
+      defaultPath: typeof suggestedName === "string" ? suggestedName : "snapshot.json",
+      filters: [{ name: "AmpCore snapshot", extensions: ["json"] }]
+    });
+    if (result.canceled || !result.filePath) return { ok: false, canceled: true };
+    fs.writeFileSync(result.filePath, String(content ?? ""), "utf8");
+    return { ok: true, path: result.filePath };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle("snapshot:open-file", async () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return { ok: false, error: "No window" };
+  try {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: "Import snapshot",
+      properties: ["openFile"],
+      filters: [{ name: "AmpCore snapshot", extensions: ["json"] }]
+    });
+    if (result.canceled || result.filePaths.length === 0) return { ok: false, canceled: true };
+    const filePath = result.filePaths[0];
+    return { ok: true, path: filePath, content: fs.readFileSync(filePath, "utf8") };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+});
+
+ipcMain.handle("snapshot:open-folder", async () => {
+  try {
+    const directory = getSnapshotsDir();
+    fs.mkdirSync(directory, { recursive: true });
+    const error = await shell.openPath(directory);
+    if (error) return { ok: false, error };
+    return { ok: true, path: directory };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 });
 

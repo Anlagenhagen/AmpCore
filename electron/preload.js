@@ -10,6 +10,10 @@ contextBridge.exposeInMainWorld("electronWindow", {
   toggleMaximize: () => ipcRenderer.invoke("window:toggle-maximize"),
   close: () => ipcRenderer.invoke("window:close"),
   isMaximized: () => ipcRenderer.invoke("window:is-maximized"),
+  saveSnapshotFile: (suggestedName, content) =>
+    ipcRenderer.invoke("snapshot:save-file", suggestedName, content),
+  openSnapshotFile: () => ipcRenderer.invoke("snapshot:open-file"),
+  openSnapshotFolder: () => ipcRenderer.invoke("snapshot:open-folder"),
   onMaximizedChange: (callback) => {
     const listener = (_event, maximized) => callback(Boolean(maximized));
     ipcRenderer.on("window:maximized-changed", listener);

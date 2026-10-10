@@ -5,6 +5,7 @@ import { useProjectStore } from "@/stores/ProjectStore";
 import { useAmpStore } from "@/stores/AmpStore";
 import { useTabStore } from "@/stores/TabStore";
 import { AssignAmpsDialog } from "@/components/dialogs/assign-amps-dialog";
+import { ProjectSnapshotDialog } from "@/components/dialogs/project-snapshot-dialog";
 import { AssignDemoAmpsDialog } from "@/components/dialogs/assign-demo-amps-dialog";
 import { AmpTabs } from "@/components/monitor/amp-tabs";
 import { NoProjectCard } from "@/components/monitor/no-project-card";
@@ -34,6 +35,7 @@ export function MonitorPage({ dictionary }: MonitorPageProps) {
 
             <div className="flex flex-wrap items-center gap-2">
               {selectedProject.projectMode === "demo" ? <AssignDemoAmpsDialog /> : <AssignAmpsDialog />}
+              {selectedProject.projectMode !== "demo" && <ProjectSnapshotDialog />}
             </div>
           </div>
         </section>

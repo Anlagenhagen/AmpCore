@@ -400,6 +400,23 @@ class AmpController extends EventEmitter {
    *  undefined if the amp isn't discovered. Needed to parse FC=27 trailer fields
    *  (e.g. muteIn) correctly — the trailer size varies by firmware, so the count
    *  must not be derived from the payload length. */
+  /**
+   * Discovery (FC=0) facts for an amp: name, version string, channel counts.
+   *
+   * A snapshot labels its amps with what the rack looked like at capture time,
+   * so the mapping UI can later say "DSP-3004D2 (4 ch)" instead of a bare MAC.
+   */
+  getDiscoveryInfoForMac(
+    mac: string
+  ): { name: string; ip: string; version: string; basicInfo: BasicInfoSnapshot } | undefined {
+    for (const [m, entry] of this.knownMacs) {
+      if (m.toUpperCase() === mac.toUpperCase()) {
+        return { name: entry.name, ip: entry.ip, version: entry.version, basicInfo: entry.basicInfo };
+      }
+    }
+    return undefined;
+  }
+
   getChannelCountForMac(mac: string): number | undefined {
     for (const [m, entry] of this.knownMacs) {
       if (m.toUpperCase() === mac.toUpperCase()) {
