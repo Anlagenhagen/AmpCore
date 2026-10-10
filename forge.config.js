@@ -20,6 +20,11 @@ const packagerConfig = {
   executableName: "AmpCore",
   appBundleId: "com.ampcore.app",
   appCategoryType: "public.app-category.music",
+  // macOS 15+ only lets an app talk to the local network after the user allows
+  // it, and asks with this text. Without it there is no clear prompt.
+  extendInfo: {
+    NSLocalNetworkUsageDescription: "AmpCore findet und steuert die CVR-Endstufen im lokalen Netzwerk."
+  },
   icon: path.join(__dirname, "public", "logo"),
   asar: {
     unpack: "**/*.node"
@@ -117,6 +122,21 @@ module.exports = {
   ],
 
   hooks: {
+    // The packaged app is ad-hoc signed with Electron's identifier
+    // (com.github.Electron), not our bundle id. macOS then cannot match the
+    // "Local Network" permission to the app: the toggle shows as allowed, yet
+    // every incoming UDP packet is dropped and no amp is ever discovered
+    // (observed 2026-10-10 on macOS 27). Re-sign so identifier = bundle id.
+    postPackage: async (_forgeConfig, { platform, outputPaths }) => {
+      if (platform !== "darwin") return;
+      const { execFileSync } = require("child_process");
+      for (const dir of outputPaths) {
+        const app = path.join(dir, `${packagerConfig.name}.app`);
+        execFileSync("codesign", ["--force", "--deep", "--sign", "-", app], { stdio: "inherit" });
+        console.log(`✓ Re-signed ${app} as ${packagerConfig.appBundleId}`);
+      }
+    },
+
     generateAssets: async () => {
       const { execSync } = require("child_process");
       const fs = require("fs");
